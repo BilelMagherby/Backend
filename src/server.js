@@ -2,9 +2,21 @@ import { createServer } from 'node:http'
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
+import { Readable } from 'node:stream'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
+import { del as deleteBlob, get as getBlob, head as getBlobMetadata } from '@vercel/blob'
+import { handleUpload as handleBlobUpload } from '@vercel/blob/client'
+import postgres from 'postgres'
+import { buildCeoDashboard } from './ceo-dashboard.js'
+import {
+  handleMailOAuthCallback,
+  handleMailPush,
+  handleMailRequest,
+  renewMailWatches,
+  scheduleMailWatchRenewal,
+} from './mails/gmail.js'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(ROOT, process.env.DATA_DIR) : path.join(ROOT, 'data')
@@ -22,6 +34,7 @@ const loginAttempts = new Map()
 let writeQueue = Promise.resolve()
 let database
 let databaseReady
+let postgresClient
 let clickupCache
 let clickupCachedAt = 0
 let clickupPending
@@ -31,6 +44,58 @@ function emptyStore() {
 }
 
 async function openDatabase() {
+  if (process.env.VERCEL && !process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL must be configured for persistent Vercel storage.')
+  }
+  if (process.env.VERCEL && !process.env.BLOB_READ_WRITE_TOKEN) {
+    throw new Error('BLOB_READ_WRITE_TOKEN must be configured for private Vercel file storage.')
+  }
+  if (process.env.DATABASE_URL) {
+    if (!databaseReady) {
+      databaseReady = (async () => {
+        postgresClient = postgres(process.env.DATABASE_URL, {
+          max: 1,
+          idle_timeout: 20,
+          connect_timeout: 10,
+          prepare: false,
+        })
+        await postgresClient`CREATE TABLE IF NOT EXISTS app_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            store_json JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL
+          )`
+        await postgresClient`CREATE TABLE IF NOT EXISTS audit_events (
+            id BIGSERIAL PRIMARY KEY,
+            created_at TIMESTAMPTZ NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_name TEXT NOT NULL,
+            action TEXT NOT NULL,
+            collection TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            details_json JSONB NOT NULL
+          )`
+        await postgresClient`CREATE INDEX IF NOT EXISTS audit_events_created_at ON audit_events(created_at DESC)`
+        await postgresClient`CREATE TABLE IF NOT EXISTS auth_sessions (
+            session_id TEXT PRIMARY KEY,
+            user_json JSONB NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL
+          )`
+        await postgresClient`CREATE TABLE IF NOT EXISTS login_attempts (
+            remote_address TEXT PRIMARY KEY,
+            attempt_count INTEGER NOT NULL,
+            reset_at BIGINT NOT NULL
+          )`
+        await postgresClient`
+          INSERT INTO app_state (id, store_json, updated_at)
+          VALUES (1, ${JSON.stringify(emptyStore())}::jsonb, NOW())
+          ON CONFLICT (id) DO NOTHING
+        `
+        return postgresClient
+      })()
+    }
+    return databaseReady
+  }
+
   if (!databaseReady) {
     databaseReady = (async () => {
       await mkdir(DATA_DIR, { recursive: true })
@@ -82,10 +147,12 @@ async function openDatabase() {
 
 async function readStore() {
   const db = await openDatabase()
-  const row = db.prepare('SELECT store_json FROM app_state WHERE id = 1').get()
+  const row = process.env.DATABASE_URL
+    ? (await db`SELECT store_json FROM app_state WHERE id = 1`)[0]
+    : db.prepare('SELECT store_json FROM app_state WHERE id = 1').get()
   if (!row) throw new Error('TaskFlow database is missing its application state.')
   try {
-    const parsed = JSON.parse(row.store_json)
+    const parsed = typeof row.store_json === 'string' ? JSON.parse(row.store_json) : row.store_json
     if (!parsed || typeof parsed !== 'object' || !parsed.auth || !parsed.documents) {
       throw new Error('The TaskFlow database has an invalid application state.')
     }
@@ -99,6 +166,36 @@ async function readStore() {
 function updateStore(update, audit) {
   const operation = writeQueue.then(async () => {
     const db = await openDatabase()
+    if (process.env.DATABASE_URL) {
+      return db.begin(async (transaction) => {
+        await transaction`SELECT pg_advisory_xact_lock(731904126)`
+        const [row] = await transaction`SELECT store_json FROM app_state WHERE id = 1 FOR UPDATE`
+        if (!row) throw new Error('TaskFlow database is missing its application state.')
+        const store = row.store_json
+        const result = update(store)
+        const updatedAt = new Date().toISOString()
+        await transaction`
+          UPDATE app_state SET store_json = ${JSON.stringify(store)}::jsonb, updated_at = ${updatedAt}
+          WHERE id = 1
+        `
+        if (audit) {
+          await transaction`
+            INSERT INTO audit_events
+              (created_at, actor_id, actor_name, action, collection, document_id, details_json)
+            VALUES (
+              ${updatedAt},
+              ${String(audit.actorId || 'system')},
+              ${String(audit.actorName || 'System')},
+              ${String(audit.action)},
+              ${String(audit.collection || '')},
+              ${String(audit.documentId || '')},
+              ${JSON.stringify(audit.details || {})}::jsonb
+            )
+          `
+        }
+        return result
+      })
+    }
     db.exec('BEGIN IMMEDIATE')
     try {
       const row = db.prepare('SELECT store_json FROM app_state WHERE id = 1').get()
@@ -161,7 +258,7 @@ function json(res, status, body, headers = {}) {
 }
 
 function setCookie(res, token, maxAge) {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : ''
+  const secure = process.env.NODE_ENV === 'production' || process.env.VERCEL ? '; Secure' : ''
   res.setHeader(
     'Set-Cookie',
     `taskflow_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure}`
@@ -169,7 +266,7 @@ function setCookie(res, token, maxAge) {
 }
 
 function clearCookie(res) {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : ''
+  const secure = process.env.NODE_ENV === 'production' || process.env.VERCEL ? '; Secure' : ''
   res.setHeader('Set-Cookie', `taskflow_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`)
 }
 
@@ -179,8 +276,17 @@ function cookieValue(req, key) {
   return match ? decodeURIComponent(match.slice(key.length + 1)) : ''
 }
 
-function sessionUser(req) {
+async function sessionUser(req) {
   const token = cookieValue(req, 'taskflow_session')
+  if (!token) return null
+  if (process.env.DATABASE_URL) {
+    const db = await openDatabase()
+    const [session] = await db`
+      SELECT user_json FROM auth_sessions
+      WHERE session_id = ${token} AND expires_at > NOW()
+    `
+    return session ? { ...session.user_json, token } : null
+  }
   const session = sessions.get(token)
   if (!session) return null
   if (session.expiresAt <= Date.now()) {
@@ -192,6 +298,7 @@ function sessionUser(req) {
 
 function canAccess(user, collection, method, data) {
   if (user.isAdmin) return true
+  if (collection === 'kpiNotes' || collection === 'kpiReviews') return false
   const permissions = new Set(user.permissions || [])
   if (collection === 'roles' || collection === 'users') return false
   if (collection === 'config') return method === 'GET' || method === 'HEAD'
@@ -210,6 +317,17 @@ function canAccess(user, collection, method, data) {
 }
 
 async function requestBody(req, limit = JSON_LIMIT) {
+  if (req.body !== undefined) {
+    const raw = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body))
+    if (raw.length > limit) {
+      const error = new Error(`Request body exceeds the ${Math.round(limit / 1024 / 1024)} MB limit.`)
+      error.status = 413
+      throw error
+    }
+    return raw
+  }
   const chunks = []
   let length = 0
   for await (const chunk of req) {
@@ -244,17 +362,50 @@ function getPath(query) {
   return { collection: parts[0], id: parts[1] }
 }
 
-function taskflowSession(user, remember) {
+async function taskflowSession(user, remember) {
   const token = randomBytes(32).toString('base64url')
-  sessions.set(token, {
-    user,
-    expiresAt: Date.now() + (remember ? SESSION_TTL : 12 * 60 * 60 * 1000),
-  })
+  const expiresAt = Date.now() + (remember ? SESSION_TTL : 12 * 60 * 60 * 1000)
+  if (process.env.DATABASE_URL) {
+    const db = await openDatabase()
+    await db`
+      INSERT INTO auth_sessions (session_id, user_json, expires_at)
+      VALUES (${token}, ${JSON.stringify(user)}::jsonb, ${new Date(expiresAt).toISOString()})
+    `
+  } else {
+    sessions.set(token, { user, expiresAt })
+  }
   return token
 }
 
-function tooManyAttempts(key) {
+async function deleteSession(token) {
+  if (process.env.DATABASE_URL) {
+    const db = await openDatabase()
+    await db`DELETE FROM auth_sessions WHERE session_id = ${token}`
+    return
+  }
+  sessions.delete(token)
+}
+
+async function tooManyAttempts(key) {
   const now = Date.now()
+  if (process.env.DATABASE_URL) {
+    const db = await openDatabase()
+    const [attempt] = await db`
+      INSERT INTO login_attempts (remote_address, attempt_count, reset_at)
+      VALUES (${key}, 1, ${now + 15 * 60 * 1000})
+      ON CONFLICT (remote_address) DO UPDATE SET
+        attempt_count = CASE
+          WHEN login_attempts.reset_at <= ${now} THEN 1
+          ELSE login_attempts.attempt_count + 1
+        END,
+        reset_at = CASE
+          WHEN login_attempts.reset_at <= ${now} THEN ${now + 15 * 60 * 1000}
+          ELSE login_attempts.reset_at
+        END
+      RETURNING attempt_count
+    `
+    return attempt.attempt_count > 10
+  }
   const existing = loginAttempts.get(key) || { count: 0, resetAt: now + 15 * 60 * 1000 }
   if (existing.resetAt <= now) {
     loginAttempts.set(key, { count: 1, resetAt: now + 15 * 60 * 1000 })
@@ -279,7 +430,7 @@ function validateOrigin(req) {
 
 async function handleAuth(req, res, url) {
   const store = await readStore()
-  const user = sessionUser(req)
+  const user = await sessionUser(req)
   if (req.method === 'GET') {
     return json(res, 200, {
       configured: Boolean(store.auth.adminPin),
@@ -292,7 +443,7 @@ async function handleAuth(req, res, url) {
   const body = await jsonBody(req)
   if (body.action === 'logout') {
     const token = user?.token
-    if (token) sessions.delete(token)
+    if (token) await deleteSession(token)
     if (user) {
       await updateStore(
         () => {},
@@ -325,8 +476,8 @@ async function handleAuth(req, res, url) {
     )
     return json(res, 200, { ok: true })
   }
-  const key = req.socket.remoteAddress || 'unknown'
-  if (tooManyAttempts(key)) return json(res, 429, { error: 'Too many PIN attempts. Wait 15 minutes and try again.' })
+  const key = req.headers['x-vercel-forwarded-for'] || req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown'
+  if (await tooManyAttempts(String(key).split(',')[0].trim())) return json(res, 429, { error: 'Too many PIN attempts. Wait 15 minutes and try again.' })
   if (body.action === 'setup') {
     if (store.auth.adminPin) return json(res, 409, { error: 'The dashboard PIN has already been configured.' })
     if (!/^\d{4,8}$/.test(body.pin || '')) return json(res, 400, { error: 'PIN must contain 4–8 digits.' })
@@ -343,7 +494,7 @@ async function handleAuth(req, res, url) {
       { actorId: 'admin', actorName: 'Admin', action: 'auth.pin.setup' }
     )
     const admin = { id: 'admin', name: 'Admin', isAdmin: true, permissions: [] }
-    setCookie(res, taskflowSession(admin, body.remember !== false), body.remember !== false ? SESSION_TTL / 1000 : 12 * 60 * 60)
+    setCookie(res, await taskflowSession(admin, body.remember !== false), body.remember !== false ? SESSION_TTL / 1000 : 12 * 60 * 60)
     return json(res, 200, { ok: true, activeUser: admin })
   }
   if (body.action !== 'login' || !/^\d{4,8}$/.test(body.pin || '')) {
@@ -368,7 +519,7 @@ async function handleAuth(req, res, url) {
     () => {},
     { actorId: activeUser.id, actorName: activeUser.name, action: 'auth.login' }
   )
-  setCookie(res, taskflowSession(activeUser, remember), remember ? SESSION_TTL / 1000 : 12 * 60 * 60)
+  setCookie(res, await taskflowSession(activeUser, remember), remember ? SESSION_TTL / 1000 : 12 * 60 * 60)
   return json(res, 200, { ok: true, activeUser })
 }
 
@@ -511,6 +662,29 @@ async function handleDocs(req, res, url, user) {
     if (!Object.hasOwn(body, 'data') || !body.data || typeof body.data !== 'object' || Array.isArray(body.data)) {
       return json(res, 400, { error: 'Document data must be a JSON object.' })
     }
+    if (target.collection === 'kpiReviews') {
+      const categories = ['communication', 'targets', 'delivery', 'teamwork', 'development']
+      const scoreEntries = Object.entries(body.data.scores || {})
+      const date = body.data.date
+      const validDate =
+        typeof date === 'string' &&
+        /^\d{4}-\d{2}-\d{2}$/.test(date) &&
+        !Number.isNaN(Date.parse(`${date}T00:00:00Z`)) &&
+        new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) === date
+      if (
+        typeof body.data.employee !== 'string' ||
+        !body.data.employee.trim() ||
+        body.data.employee.length > 70 ||
+        !validDate ||
+        scoreEntries.length !== categories.length ||
+        scoreEntries.some(
+          ([category, score]) =>
+            !categories.includes(category) || !Number.isInteger(score) || score < 0 || score > 10
+        )
+      ) {
+        return json(res, 400, { error: 'Employee ratings must include a valid employee, date, and five scores from 0 to 10.' })
+      }
+    }
     const saved = await updateStore(
       (store) => {
         store.documents[target.collection] ||= {}
@@ -578,6 +752,70 @@ async function handleDocs(req, res, url, user) {
 }
 
 async function handleFileUpload(req, res, user, scope) {
+  if (process.env.DATABASE_URL) {
+    const body = await jsonBody(req)
+    const result = await handleBlobUpload({
+      body,
+      request: req,
+      onBeforeGenerateToken: async (pathname, clientPayload) => {
+        let payload
+        try {
+          payload = JSON.parse(clientPayload || '{}')
+        } catch {
+          throw new Error('Invalid upload metadata.')
+        }
+        if (
+          !/^[a-f0-9]{36}$/.test(pathname) ||
+          payload.id !== pathname ||
+          payload.scope !== scope ||
+          typeof payload.name !== 'string' ||
+          !payload.name.trim() ||
+          payload.name.length > 255 ||
+          !['config', 'foodics', 'gulf'].includes(scope) ||
+          !user ||
+          !canAccess(user, scope, 'POST')
+        ) {
+          throw new Error('Invalid file upload.')
+        }
+        return {
+          addRandomSuffix: false,
+          maximumSizeInBytes: UPLOAD_LIMIT,
+          tokenPayload: JSON.stringify({
+            id: pathname,
+            name: path.basename(payload.name).slice(0, 255),
+            scope,
+            owner: user.id,
+            ownerName: user.name,
+          }),
+        }
+      },
+      onUploadCompleted: async ({ blob, tokenPayload }) => {
+        const metadata = JSON.parse(tokenPayload)
+        const storedBlob = await getBlobMetadata(blob.pathname, { access: 'private' })
+        await updateStore(
+          (store) => {
+            store.uploads ||= {}
+            store.uploads[metadata.id] = {
+              name: metadata.name,
+              scope: metadata.scope,
+              size: storedBlob.size,
+              owner: metadata.owner,
+              pathname: blob.pathname,
+            }
+          },
+          {
+            actorId: metadata.owner,
+            actorName: metadata.ownerName,
+            action: 'file.upload',
+            collection: metadata.scope,
+            documentId: metadata.id,
+            details: { name: metadata.name, size: storedBlob.size },
+          }
+        )
+      },
+    })
+    return json(res, 200, result)
+  }
   if (!['config', 'foodics', 'gulf'].includes(scope)) {
     return json(res, 400, { error: 'Choose a supported file collection.' })
   }
@@ -628,6 +866,25 @@ async function handleFile(req, res, pathname, user) {
   const store = await readStore()
   const metadata = store.uploads?.[id]
   if (!metadata || !canAccess(user, metadata.scope, 'GET')) return json(res, 404, { error: 'File not found.' })
+  if (process.env.DATABASE_URL) {
+    const blob = req.method === 'HEAD'
+      ? await getBlobMetadata(metadata.pathname, { access: 'private' })
+      : await getBlob(metadata.pathname, { access: 'private' })
+    if (!blob || (req.method !== 'HEAD' && blob.statusCode !== 200)) return json(res, 404, { error: 'File not found.' })
+    const safeName = metadata.name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\\r\n]/g, '_')
+    const encodedName = encodeURIComponent(metadata.name).replace(/['()*]/g, (char) =>
+      `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+    )
+    res.writeHead(200, {
+      'Content-Type': blob.blob.contentType || 'application/octet-stream',
+      'Content-Length': String(blob.blob.size),
+      'Content-Disposition': `attachment; filename="${safeName}"; filename*=UTF-8''${encodedName}`,
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'private, no-store',
+    })
+    if (req.method === 'HEAD') return res.end()
+    return Readable.fromWeb(blob.stream).pipe(res)
+  }
   const filePath = path.join(UPLOAD_DIR, id)
   const fileInfo = await stat(filePath)
   const safeName = metadata.name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\\r\n]/g, '_')
@@ -653,9 +910,13 @@ async function removeFile(req, res, pathname, user) {
   const store = await readStore()
   const metadata = store.uploads?.[id]
   if (!metadata || !canAccess(user, metadata.scope, 'DELETE')) return json(res, 404, { error: 'File not found.' })
-  await unlink(path.join(UPLOAD_DIR, id)).catch((error) => {
-    if (error.code !== 'ENOENT') throw error
-  })
+  if (process.env.DATABASE_URL) {
+    await deleteBlob(metadata.pathname, { access: 'private' })
+  } else {
+    await unlink(path.join(UPLOAD_DIR, id)).catch((error) => {
+      if (error.code !== 'ENOENT') throw error
+    })
+  }
   await updateStore(
     (current) => {
       delete current.uploads[id]
@@ -852,6 +1113,24 @@ async function handleClickup(req, res, url, user) {
   }
 }
 
+async function handleCeoDashboard(req, res, url, user) {
+  if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed.' }, { Allow: 'GET' })
+  if (!user.isAdmin && !user.permissions?.includes('dash')) {
+    return json(res, 403, { error: 'Your account does not have access to the CEO dashboard.' })
+  }
+  const projectId = url.searchParams.get('project') || ''
+  const assignee = url.searchParams.get('assignee') || ''
+  const status = url.searchParams.get('status') || ''
+  if (projectId.length > 160 || assignee.length > 70) {
+    return json(res, 400, { error: 'Dashboard filters exceed the allowed length.' })
+  }
+  if (!['', 'To Do', 'In Progress', 'Review', 'Done', 'Overdue'].includes(status)) {
+    return json(res, 400, { error: 'Dashboard status filter is invalid.' })
+  }
+  const store = await readStore()
+  return json(res, 200, buildCeoDashboard(store, { projectId, assignee, status }))
+}
+
 async function handleRequest(req, res) {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Referrer-Policy', 'same-origin')
@@ -864,26 +1143,60 @@ async function handleRequest(req, res) {
     return json(res, 200, { status: 'ok', service: 'taskflow-api' })
   }
   if (pathname.startsWith('/api/')) {
+    if (process.env.DATABASE_URL && pathname === '/api/files' && req.method === 'POST') {
+      const body = await jsonBody(req)
+      req.body = body
+      if (body.type === 'blob.upload-completed') {
+        return await handleFileUpload(req, res, null, url.searchParams.get('scope') || '')
+      }
+    }
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !validateOrigin(req)) {
       return json(res, 403, { error: 'Request origin is not allowed.' })
     }
+    if (pathname === '/api/cron/gmail-watch') {
+      if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed.' }, { Allow: 'GET' })
+      if (!process.env.MAILS_PUBSUB_TOPIC) return json(res, 200, { configured: false, skipped: true })
+      const expected = process.env.CRON_SECRET || ''
+      const provided = (req.headers.authorization || '').replace(/^Bearer\s+/i, '')
+      const expectedBuffer = Buffer.from(expected)
+      const providedBuffer = Buffer.from(provided)
+      if (!expected || expectedBuffer.length !== providedBuffer.length || !timingSafeEqual(expectedBuffer, providedBuffer)) {
+        return json(res, 401, { error: 'Cron authorization is invalid.' })
+      }
+      return json(res, 200, await renewMailWatches({ readStore, updateStore }))
+    }
     if (pathname === '/api/auth') return await handleAuth(req, res, url)
-    const user = sessionUser(req)
+    if (pathname === '/api/mails/pubsub' && req.method === 'POST') {
+      return await handleMailPush(req, res, { readStore, updateStore })
+    }
+    if (pathname === '/api/mails/auth/google/callback' && req.method === 'GET') {
+      return await handleMailOAuthCallback(req, res, url, { readStore, updateStore })
+    }
+    const user = await sessionUser(req)
     if (!user) return json(res, 401, { error: 'Sign in to access the dashboard.' })
+    if (pathname.startsWith('/api/mails/')) {
+      return await handleMailRequest(req, res, url, user, { json, jsonBody, readStore, updateStore })
+    }
     if (pathname === '/api/users') return await handleUsers(req, res, user)
     if (pathname === '/api/docs') return await handleDocs(req, res, url, user)
+    if (pathname === '/api/dashboard/ceo') return await handleCeoDashboard(req, res, url, user)
     if (pathname === '/api/audit') {
       if (!user.isAdmin) return json(res, 403, { error: 'Admin access is required to view the activity log.' })
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed.' }, { Allow: 'GET' })
       const requestedLimit = Number(url.searchParams.get('limit') || 200)
       const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 500) : 200
       const db = await openDatabase()
-      const events = db.prepare(`
-        SELECT id, created_at, actor_id, actor_name, action, collection, document_id, details_json
-        FROM audit_events
-        ORDER BY id DESC
-        LIMIT ?
-      `).all(limit)
+      const events = process.env.DATABASE_URL
+        ? await db`
+            SELECT id, created_at, actor_id, actor_name, action, collection, document_id, details_json
+            FROM audit_events ORDER BY id DESC LIMIT ${limit}
+          `
+        : db.prepare(`
+            SELECT id, created_at, actor_id, actor_name, action, collection, document_id, details_json
+            FROM audit_events
+            ORDER BY id DESC
+            LIMIT ?
+          `).all(limit)
       return json(
         res,
         200,
@@ -895,7 +1208,7 @@ async function handleRequest(req, res) {
           action: event.action,
           collection: event.collection,
           documentId: event.document_id,
-          details: JSON.parse(event.details_json),
+          details: typeof event.details_json === 'string' ? JSON.parse(event.details_json) : event.details_json,
         }))
       )
     }
@@ -932,17 +1245,28 @@ async function handleRequest(req, res) {
   return json(res, 404, { error: 'Not found.' })
 }
 
-export function createAppServer() {
-  const server = createServer((req, res) => {
-    handleRequest(req, res).catch((error) => {
-      console.error('[taskflow-api]', error)
-      if (res.headersSent) return res.destroy(error)
-      json(res, error.status || 500, {
-        error: error.status ? error.message : 'The server could not complete the request.',
-      })
+export async function handleVercelRequest(req, res) {
+  try {
+    await handleRequest(req, res)
+  } catch (error) {
+    console.error('[taskflow-api]', error)
+    if (res.headersSent) return res.destroy(error)
+    json(res, error.status || 500, {
+      error: error.status ? error.message : 'The server could not complete the request.',
     })
+  }
+}
+
+export function createAppServer() {
+  let stopMailWatchRenewal
+  const server = createServer((req, res) => {
+    handleVercelRequest(req, res)
+  })
+  server.on('listening', () => {
+    stopMailWatchRenewal = scheduleMailWatchRenewal({ readStore, updateStore })
   })
   server.on('close', () => {
+    stopMailWatchRenewal?.()
     if (database) {
       database.close()
       database = undefined

@@ -85,6 +85,88 @@ test('requires authentication and configures the admin PIN once', async () => {
   assert.equal(preservedLegacyFile.documents.tasks.migrated.data.title, 'Imported from previous backend')
 })
 
+test('keeps Gmail account state authenticated and binds OAuth state to the browser', async () => {
+  const unauthenticated = await call('/api/mails/status')
+  assert.equal(unauthenticated.response.status, 401)
+
+  const status = await call('/api/mails/status', { cookie: adminCookie })
+  assert.equal(status.response.status, 200)
+  assert.deepEqual(status.body, { connected: false, email: '', connectedAt: '', lastSyncAt: '' })
+  const anonymousSummary = await call('/api/mails/summary')
+  assert.equal(anonymousSummary.response.status, 401)
+  const disconnectedSummary = await call('/api/mails/summary', { cookie: adminCookie })
+  assert.deepEqual(disconnectedSummary.body, {
+    connected: false,
+    email: '',
+    unreadCount: 0,
+    messages: [],
+  })
+
+  const saved = {
+    clientId: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    redirectUri: process.env.GOOGLE_REDIRECT_URI,
+    encryptionKey: process.env.MAILS_TOKEN_ENCRYPTION_KEY,
+  }
+  try {
+    process.env.GOOGLE_CLIENT_ID = 'test-client-id'
+    process.env.GOOGLE_CLIENT_SECRET = 'test-client-secret'
+    process.env.GOOGLE_REDIRECT_URI = 'http://localhost:8889/api/mails/auth/google/callback'
+    process.env.MAILS_TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64')
+    const authorization = await call('/api/mails/auth/google', { cookie: adminCookie })
+    assert.equal(authorization.response.status, 200)
+    const authorizationUrl = new URL(authorization.body.url)
+    assert.equal(authorizationUrl.hostname, 'accounts.google.com')
+    assert.equal(authorizationUrl.searchParams.get('redirect_uri'), 'http://localhost:8889/api/mails/auth/google/callback')
+    assert.equal(authorizationUrl.searchParams.get('access_type'), 'offline')
+    const state = authorizationUrl.searchParams.get('state')
+    assert.ok(state)
+
+    const callbackWithoutBrowserCookie = await fetch(
+      `${baseUrl}/api/mails/auth/google/callback?state=${encodeURIComponent(state)}&code=unused`,
+      { redirect: 'manual' }
+    )
+    assert.equal(callbackWithoutBrowserCookie.status, 302)
+    assert.match(callbackWithoutBrowserCookie.headers.get('location'), /gmail=error/)
+    assert.match(callbackWithoutBrowserCookie.headers.get('set-cookie'), /taskflow_gmail_oauth=;/)
+  } finally {
+    if (saved.clientId === undefined) delete process.env.GOOGLE_CLIENT_ID
+    else process.env.GOOGLE_CLIENT_ID = saved.clientId
+    if (saved.clientSecret === undefined) delete process.env.GOOGLE_CLIENT_SECRET
+    else process.env.GOOGLE_CLIENT_SECRET = saved.clientSecret
+    if (saved.redirectUri === undefined) delete process.env.GOOGLE_REDIRECT_URI
+    else process.env.GOOGLE_REDIRECT_URI = saved.redirectUri
+    if (saved.encryptionKey === undefined) delete process.env.MAILS_TOKEN_ENCRYPTION_KEY
+    else process.env.MAILS_TOKEN_ENCRYPTION_KEY = saved.encryptionKey
+  }
+})
+
+test('rejects unauthenticated Gmail Pub/Sub notifications before processing payloads', async () => {
+  const names = [
+    'MAILS_PUBSUB_TOPIC',
+    'MAILS_PUBSUB_SUBSCRIPTION',
+    'MAILS_PUBSUB_AUDIENCE',
+    'MAILS_PUBSUB_SERVICE_ACCOUNT',
+  ]
+  const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]))
+  try {
+    process.env.MAILS_PUBSUB_TOPIC = 'projects/taskflow-test/topics/gmail'
+    process.env.MAILS_PUBSUB_SUBSCRIPTION = 'projects/taskflow-test/subscriptions/gmail-push'
+    process.env.MAILS_PUBSUB_AUDIENCE = 'https://api.example.test/api/mails/pubsub'
+    process.env.MAILS_PUBSUB_SERVICE_ACCOUNT = 'gmail-push@example.test'
+    const response = await call('/api/mails/pubsub', {
+      method: 'POST',
+      body: { message: { data: 'e30=' } },
+    })
+    assert.equal(response.response.status, 401)
+  } finally {
+    for (const name of names) {
+      if (saved[name] === undefined) delete process.env[name]
+      else process.env[name] = saved[name]
+    }
+  }
+})
+
 test('persists document CRUD and bulk imports', async () => {
   const created = await call('/api/docs', {
     method: 'PUT',
@@ -109,6 +191,35 @@ test('persists document CRUD and bulk imports', async () => {
   assert.ok(listed.body.some((row) => row.id === 'task-1' && row.data.status === 'Done'))
   assert.ok(listed.body.some((row) => row.id === 'migrated'))
 
+  const employeeReview = await call('/api/docs', {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: {
+      path: 'kpiReviews/review-employee-1',
+      data: {
+        employee: 'Team member',
+        date: '2026-11-05',
+        scores: { communication: 8, targets: 7, delivery: 9, teamwork: 8, development: 10 },
+      },
+    },
+  })
+  assert.equal(employeeReview.response.status, 201)
+  const employeeReviews = await call('/api/docs?collection=kpiReviews', { cookie: adminCookie })
+  assert.ok(employeeReviews.body.some((row) => row.id === 'review-employee-1'))
+  const invalidEmployeeReview = await call('/api/docs', {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: {
+      path: 'kpiReviews/review-invalid',
+      data: {
+        employee: 'Team member',
+        date: '2026-11-05',
+        scores: { communication: 11, targets: 7, delivery: 9, teamwork: 8, development: 10 },
+      },
+    },
+  })
+  assert.equal(invalidEmployeeReview.response.status, 400)
+
   const preferences = await call('/api/docs', {
     method: 'PUT',
     cookie: adminCookie,
@@ -121,6 +232,144 @@ test('persists document CRUD and bulk imports', async () => {
   assert.equal(savedState.documents.preferences.admin.data.taskMode, 'board')
   assert.ok(persistentStore.prepare('SELECT count(*) AS count FROM audit_events').get().count >= 3)
   persistentStore.close()
+})
+
+test('serves a filtered CEO dashboard aggregate only to CEO dashboard users', async () => {
+  const unauthenticated = await call('/api/dashboard/ceo')
+  assert.equal(unauthenticated.response.status, 401)
+
+  const config = await call('/api/docs', {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: {
+      path: 'config/main',
+      data: {
+        projects: [
+          { id: 'root', name: 'Root', color: '#000000', parent: '' },
+          { id: 'alpha', name: 'Alpha', color: '#111111', parent: 'root' },
+          { id: 'beta', name: 'Beta', color: '#222222', parent: 'root' },
+        ],
+        target: 1,
+        w: { ontime: 35, target: 20, overdue: 15, volume: 30 },
+      },
+    },
+  })
+  assert.equal(config.response.status, 201)
+
+  const localTask = await call('/api/docs', {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: {
+      path: 'tasks/local-task',
+      data: {
+        title: 'Local task',
+        project: 'beta',
+        assignee: 'Local Owner',
+        status: 'To Do',
+        due: '2099-01-01',
+        updated: 3,
+      },
+    },
+  })
+  assert.equal(localTask.response.status, 201)
+
+  const clickupSnapshot = await call('/api/docs', {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: {
+      path: 'integrations/clickup',
+      data: {
+        configured: true,
+        members: [{ id: 'clickup-owner', name: 'ClickUp Owner' }],
+        tasks: [
+          {
+            id: 'clickup-done',
+            name: 'Completed ClickUp task',
+            status: { status: 'complete', type: 'done' },
+            assignees: [{ id: 'clickup-owner' }],
+            list: { name: 'Alpha' },
+            due_date: String(Date.parse('2020-06-02T23:59:59Z')),
+            date_closed: Date.parse('2020-06-02T12:00:00Z'),
+            date_updated: '2',
+          },
+          {
+            id: 'clickup-overdue',
+            name: 'Overdue ClickUp task',
+            status: { status: 'in progress', type: 'custom' },
+            assignees: [{ id: 'clickup-owner' }],
+            list: { name: 'Alpha' },
+            due_date: String(Date.parse('2020-06-03T23:59:59Z')),
+            date_updated: '1',
+          },
+        ],
+        truncated: false,
+      },
+    },
+  })
+  assert.equal(clickupSnapshot.response.status, 201)
+
+  const users = await call('/api/users', {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: {
+      users: [
+        { id: 'ceo-viewer', name: 'CEO Viewer', pin: '4321', permissions: ['dash'] },
+        { id: 'limited-viewer', name: 'Limited Viewer', pin: '8765', permissions: ['hr'] },
+      ],
+    },
+  })
+  assert.equal(users.response.status, 200)
+
+  const ceoLogin = await call('/api/auth', {
+    method: 'POST',
+    body: { action: 'login', pin: '4321', remember: false },
+  })
+  assert.equal(ceoLogin.response.status, 200)
+
+  const summary = await call('/api/dashboard/ceo?project=root', { cookie: ceoLogin.cookie })
+  assert.equal(summary.response.status, 200)
+  assert.deepEqual(summary.body.filters, { project: 'root', assignee: '', status: '' })
+  const { teamKpiScore, ...totals } = summary.body.totals
+  assert.deepEqual(totals, {
+    tasks: 3,
+    completed: 1,
+    open: 2,
+    onTime: 1,
+    onTimeRate: 100,
+    overdue: 1,
+    employeeCount: 2,
+  })
+  assert.ok(Number.isInteger(teamKpiScore))
+  assert.equal(summary.body.statusCounts['To Do'], 1)
+  assert.equal(summary.body.statusCounts['In Progress'], 1)
+  assert.equal(summary.body.statusCounts.Done, 1)
+  assert.deepEqual(
+    summary.body.projectProgress.map(({ id, tasks, done }) => ({ id, tasks, done })),
+    [
+      { id: 'alpha', tasks: 2, done: 1 },
+      { id: 'beta', tasks: 1, done: 0 },
+    ]
+  )
+  assert.ok(summary.body.sources.taskflowTasks >= 1)
+  assert.equal(summary.body.sources.clickup.tasks, 2)
+
+  const filtered = await call('/api/dashboard/ceo?project=alpha&status=Overdue', { cookie: ceoLogin.cookie })
+  assert.equal(filtered.response.status, 200)
+  assert.equal(filtered.body.totals.tasks, 1)
+  assert.equal(filtered.body.totals.overdue, 1)
+  assert.equal(filtered.body.statusCounts['In Progress'], 1)
+
+  const invalidFilter = await call('/api/dashboard/ceo?status=unknown', { cookie: ceoLogin.cookie })
+  assert.equal(invalidFilter.response.status, 400)
+
+  const limitedLogin = await call('/api/auth', {
+    method: 'POST',
+    body: { action: 'login', pin: '8765', remember: false },
+  })
+  const denied = await call('/api/dashboard/ceo', { cookie: limitedLogin.cookie })
+  assert.equal(denied.response.status, 403)
+
+  await call('/api/users', { method: 'PUT', cookie: adminCookie, body: { users: [] } })
 })
 
 test('creates meetings and rejects malformed document paths', async () => {
@@ -193,6 +442,14 @@ test('creates role accounts whose section permissions are enforced server-side',
   assert.equal(denied.response.status, 403)
   const deniedAudit = await call('/api/audit', { cookie: login.cookie })
   assert.equal(deniedAudit.response.status, 403)
+  const deniedEmployeeReviews = await call('/api/docs?collection=kpiReviews', { cookie: login.cookie })
+  assert.equal(deniedEmployeeReviews.response.status, 403)
+  const deniedEmployeeReviewWrite = await call('/api/docs', {
+    method: 'PUT',
+    cookie: login.cookie,
+    body: { path: 'kpiReviews/review-employee-2', data: { employee: 'Team member', scores: {} } },
+  })
+  assert.equal(deniedEmployeeReviewWrite.response.status, 403)
 
   const removed = await call('/api/users', {
     method: 'PUT',
