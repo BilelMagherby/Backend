@@ -23,7 +23,7 @@ cd frontend
 npm run dev
 ```
 
-The Vite development server proxies `/api` requests to `http://localhost:8889`. Open the URL printed by Vite. On first use, create the dashboard admin PIN. Use `npm run dev:frontend-only` in the frontend folder only when you intentionally want the browser-only demo.
+The Vite development server proxies `/api` requests to `http://localhost:8889`. Open the URL printed by Vite. On first use, create the dashboard admin PIN. The default frontend uses the shared backend database. Use `npm run dev:frontend-only` in the frontend folder only when you intentionally want isolated browser-only demo storage.
 
 Run the backend tests with:
 

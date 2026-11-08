@@ -307,9 +307,9 @@ function canAccess(user, collection, method, data) {
   if (collection === 'gulf') return permissions.has('gulf')
   if (collection === 'preferences') return user.isAdmin || Boolean(user.id)
   if (collection === 'integrations') return ['dash', 'clickup'].some((permission) => permissions.has(permission))
-  if (collection === 'meetings') return ['meet', 'zoom', 'cal'].some((permission) => permissions.has(permission))
+  if (collection === 'meetings') return ['notices', 'meet', 'zoom', 'cal'].some((permission) => permissions.has(permission))
   if (collection === 'history' || collection === 'tasks' || collection === 'clickup') {
-    return ['dash', 'tasks', 'day', 'kpi', 'team', 'projects', 'cal'].some((permission) =>
+    return ['dash', 'notices', 'tasks', 'day', 'kpi', 'team', 'projects', 'cal'].some((permission) =>
       permissions.has(permission)
     )
   }
@@ -585,7 +585,7 @@ async function handleUsers(req, res, user) {
       pin,
       pinLookup: lookup,
       permissions: [...new Set(candidate.permissions.filter((permission) =>
-        ['dash', 'meet', 'zoom', 'cal', 'kpi', 'day', 'tasks', 'clickup', 'projects', 'team', 'hr', 'foodics', 'gulf'].includes(permission)
+        ['dash', 'notices', 'meet', 'zoom', 'cal', 'kpi', 'day', 'tasks', 'clickup', 'projects', 'team', 'hr', 'foodics', 'gulf'].includes(permission)
       ))],
     })
   }
@@ -771,7 +771,7 @@ async function handleFileUpload(req, res, user, scope) {
           typeof payload.name !== 'string' ||
           !payload.name.trim() ||
           payload.name.length > 255 ||
-          !['config', 'foodics', 'gulf'].includes(scope) ||
+          !['config', 'foodics', 'gulf', 'hr'].includes(scope) ||
           !user ||
           !canAccess(user, scope, 'POST')
         ) {
@@ -816,7 +816,7 @@ async function handleFileUpload(req, res, user, scope) {
     })
     return json(res, 200, result)
   }
-  if (!['config', 'foodics', 'gulf'].includes(scope)) {
+  if (!['config', 'foodics', 'gulf', 'hr'].includes(scope)) {
     return json(res, 400, { error: 'Choose a supported file collection.' })
   }
   if (!canAccess(user, scope, 'POST')) return json(res, 403, { error: 'Your account does not have access to upload here.' })

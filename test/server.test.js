@@ -428,6 +428,18 @@ test('creates role accounts whose section permissions are enforced server-side',
 
   const allowed = await call('/api/docs?collection=hr', { cookie: login.cookie })
   assert.equal(allowed.response.status, 200)
+  const hrForm = new FormData()
+  hrForm.append('file', new Blob(['private HR document']), 'employee-contract.txt')
+  const hrUpload = await fetch(`${baseUrl}/api/files?scope=hr`, {
+    method: 'POST',
+    headers: { Cookie: login.cookie },
+    body: hrForm,
+  })
+  assert.equal(hrUpload.status, 201)
+  const uploadedHrFile = await hrUpload.json()
+  assert.equal((await fetch(`${baseUrl}${uploadedHrFile.url}`, { headers: { Cookie: login.cookie } })).status, 200)
+  const removedHrFile = await call(uploadedHrFile.url, { method: 'DELETE', cookie: login.cookie })
+  assert.equal(removedHrFile.response.status, 200)
   const settings = await call('/api/docs?path=foodics-settings%2Fproject-one', { cookie: login.cookie })
   assert.equal(settings.response.status, 200)
   const ownPreferences = await call('/api/docs', {
@@ -463,6 +475,25 @@ test('creates role accounts whose section permissions are enforced server-side',
   const adminAudit = await call('/api/audit?limit=20', { cookie: adminCookie })
   assert.equal(adminAudit.response.status, 200)
   assert.ok(adminAudit.body.some((event) => event.action === 'users.save'))
+})
+
+test('notices permission exposes operational task and meeting notices without HR access', async () => {
+  const users = await call('/api/users', {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: { users: [{ id: 'notice-viewer', name: 'Notice viewer', pin: '2468', permissions: ['notices'] }] },
+  })
+  assert.equal(users.response.status, 200)
+  assert.deepEqual(users.body, [{ id: 'notice-viewer', name: 'Notice viewer', permissions: ['notices'] }])
+
+  const login = await call('/api/auth', {
+    method: 'POST',
+    body: { action: 'login', pin: '2468', remember: false },
+  })
+  assert.equal(login.response.status, 200)
+  assert.equal((await call('/api/docs?collection=tasks', { cookie: login.cookie })).response.status, 200)
+  assert.equal((await call('/api/docs?collection=meetings', { cookie: login.cookie })).response.status, 200)
+  assert.equal((await call('/api/docs?collection=hr', { cookie: login.cookie })).response.status, 403)
 })
 
 test('keeps records and the audit log after restarting the backend', async () => {
