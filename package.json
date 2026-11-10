@@ -10,5 +10,9 @@
     "start": "node --env-file-if-exists=.env src/server.js",
     "dev": "node --watch --env-file-if-exists=.env src/server.js",
     "test": "node --test"
+  },
+  "dependencies": {
+    "@vercel/blob": "2.4.0",
+    "postgres": "^3.4.7"
   }
 }
