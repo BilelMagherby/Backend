@@ -145,6 +145,37 @@ async function openDatabase() {
   return databaseReady
 }
 
+function parseJsonValue(value, fallback = null) {
+  if (value === null || value === undefined) return fallback
+  let parsed = typeof value === 'string' ? JSON.parse(value) : value
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed)
+    } catch {}
+  }
+  return parsed ?? fallback
+}
+
+function parseStoreJson(value) {
+  let store = parseJsonValue(value, null)
+  if (!store || typeof store !== 'object') {
+    store = emptyStore()
+  }
+  if (!store.auth || typeof store.auth !== 'object') {
+    store.auth = { adminPin: null, users: [] }
+  }
+  if (!Array.isArray(store.auth.users)) {
+    store.auth.users = []
+  }
+  if (!store.documents || typeof store.documents !== 'object') {
+    store.documents = {}
+  }
+  if (!store.uploads || typeof store.uploads !== 'object') {
+    store.uploads = {}
+  }
+  return store
+}
+
 async function readStore() {
   const db = await openDatabase()
   const row = process.env.DATABASE_URL
@@ -152,11 +183,7 @@ async function readStore() {
     : db.prepare('SELECT store_json FROM app_state WHERE id = 1').get()
   if (!row) throw new Error('TaskFlow database is missing its application state.')
   try {
-    const parsed = typeof row.store_json === 'string' ? JSON.parse(row.store_json) : row.store_json
-    if (!parsed || typeof parsed !== 'object' || !parsed.auth || !parsed.documents) {
-      throw new Error('The TaskFlow database has an invalid application state.')
-    }
-    return parsed
+    return parseStoreJson(row.store_json)
   } catch (error) {
     if (error instanceof SyntaxError) throw new Error('The TaskFlow database contains invalid application data.')
     throw error
@@ -171,7 +198,7 @@ function updateStore(update, audit) {
         await transaction`SELECT pg_advisory_xact_lock(731904126)`
         const [row] = await transaction`SELECT store_json FROM app_state WHERE id = 1 FOR UPDATE`
         if (!row) throw new Error('TaskFlow database is missing its application state.')
-        const store = row.store_json
+        const store = parseStoreJson(row.store_json)
         const result = update(store)
         const updatedAt = new Date().toISOString()
         await transaction`
@@ -199,7 +226,7 @@ function updateStore(update, audit) {
     db.exec('BEGIN IMMEDIATE')
     try {
       const row = db.prepare('SELECT store_json FROM app_state WHERE id = 1').get()
-      const store = JSON.parse(row.store_json)
+      const store = parseStoreJson(row.store_json)
       const result = update(store)
       db.prepare('UPDATE app_state SET store_json = ?, updated_at = ? WHERE id = 1')
         .run(JSON.stringify(store), new Date().toISOString())
@@ -290,7 +317,9 @@ async function sessionUser(req) {
       SELECT user_json FROM auth_sessions
       WHERE session_id = ${token} AND expires_at > NOW()
     `
-    return session ? { ...session.user_json, token } : null
+    if (!session) return null
+    const user = parseJsonValue(session.user_json, null)
+    return user ? { ...user, token } : null
   }
   const session = sessions.get(token)
   if (!session) return null
