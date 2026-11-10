@@ -1385,7 +1385,7 @@ export async function handleVercelRequest(req, res) {
     console.error('[taskflow-api]', error)
     if (res.headersSent) return res.destroy(error)
     json(res, error.status || 500, {
-      error: error.status ? error.message : 'The server could not complete the request.',
+      error: error.message || 'The server could not complete the request.',
     })
   }
 }
