@@ -257,17 +257,21 @@ function json(res, status, body, headers = {}) {
   res.end(JSON.stringify(body))
 }
 
-function setCookie(res, token, maxAge) {
-  const secure = process.env.NODE_ENV === 'production' || process.env.VERCEL ? '; Secure' : ''
+function setSessionCookie(req, res, token, maxAge) {
+  const crossOrigin = req.headers.origin && !sameHostOrigin(req)
+  const secure = process.env.NODE_ENV === 'production' || process.env.VERCEL || crossOrigin ? '; Secure' : ''
+  const sameSite = crossOrigin ? 'None' : 'Strict'
   res.setHeader(
     'Set-Cookie',
-    `taskflow_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure}`
+    `taskflow_session=${token}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=${maxAge}${secure}`
   )
 }
 
-function clearCookie(res) {
-  const secure = process.env.NODE_ENV === 'production' || process.env.VERCEL ? '; Secure' : ''
-  res.setHeader('Set-Cookie', `taskflow_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`)
+function clearCookie(req, res) {
+  const crossOrigin = req.headers.origin && !sameHostOrigin(req)
+  const secure = process.env.NODE_ENV === 'production' || process.env.VERCEL || crossOrigin ? '; Secure' : ''
+  const sameSite = crossOrigin ? 'None' : 'Strict'
+  res.setHeader('Set-Cookie', `taskflow_session=; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=0${secure}`)
 }
 
 function cookieValue(req, key) {
@@ -277,7 +281,8 @@ function cookieValue(req, key) {
 }
 
 async function sessionUser(req) {
-  const token = cookieValue(req, 'taskflow_session')
+  const token = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1] ||
+    cookieValue(req, 'taskflow_session')
   if (!token) return null
   if (process.env.DATABASE_URL) {
     const db = await openDatabase()
@@ -301,6 +306,7 @@ function canAccess(user, collection, method, data) {
   if (collection === 'kpiNotes' || collection === 'kpiReviews') return false
   const permissions = new Set(user.permissions || [])
   if (collection === 'roles' || collection === 'users') return false
+  if (collection.toLowerCase().startsWith('cashbank')) return permissions.has('cashbank')
   if (collection === 'config') return method === 'GET' || method === 'HEAD'
   if (collection === 'hr') return permissions.has('hr')
   if (collection === 'foodics' || collection === 'foodics-settings') return permissions.has('foodics')
@@ -416,7 +422,7 @@ async function tooManyAttempts(key) {
   return existing.count > 10
 }
 
-function validateOrigin(req) {
+function sameHostOrigin(req) {
   const origin = req.headers.origin
   if (!origin) return true
   try {
@@ -428,6 +434,30 @@ function validateOrigin(req) {
   }
 }
 
+function allowedOrigin(req) {
+  const origin = req.headers.origin
+  if (!origin) return true
+  if (sameHostOrigin(req)) return true
+  const allowedOrigins = (process.env.FRONTEND_ORIGINS || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+  return allowedOrigins.includes(origin)
+}
+
+function applyCors(req, res) {
+  const origin = req.headers.origin
+  if (!origin || !allowedOrigin(req)) return false
+  res.setHeader('Access-Control-Allow-Origin', origin)
+  res.setHeader('Access-Control-Allow-Credentials', 'true')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Vercel-Blob-Client-Payload, X-Vercel-Blob-Client-Token')
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length')
+  res.setHeader('Access-Control-Max-Age', '600')
+  res.setHeader('Vary', 'Origin')
+  return true
+}
+
 async function handleAuth(req, res, url) {
   const store = await readStore()
   const user = await sessionUser(req)
@@ -435,11 +465,12 @@ async function handleAuth(req, res, url) {
     return json(res, 200, {
       configured: Boolean(store.auth.adminPin),
       authed: Boolean(user),
+      ...(user?.token ? { token: user.token } : {}),
       ...(user ? { activeUser: user.isAdmin ? { id: 'admin', name: 'Admin', isAdmin: true } : publicUser(user) } : {}),
     })
   }
   if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed.' }, { Allow: 'GET, POST' })
-  if (!validateOrigin(req)) return json(res, 403, { error: 'Request origin is not allowed.' })
+  if (!allowedOrigin(req)) return json(res, 403, { error: 'Request origin is not allowed.' })
   const body = await jsonBody(req)
   if (body.action === 'logout') {
     const token = user?.token
@@ -450,7 +481,7 @@ async function handleAuth(req, res, url) {
         { actorId: user.id, actorName: user.name, action: 'auth.logout' }
       )
     }
-    clearCookie(res)
+    clearCookie(req, res)
     return json(res, 200, { ok: true })
   }
   if (body.action === 'change') {
@@ -494,8 +525,9 @@ async function handleAuth(req, res, url) {
       { actorId: 'admin', actorName: 'Admin', action: 'auth.pin.setup' }
     )
     const admin = { id: 'admin', name: 'Admin', isAdmin: true, permissions: [] }
-    setCookie(res, await taskflowSession(admin, body.remember !== false), body.remember !== false ? SESSION_TTL / 1000 : 12 * 60 * 60)
-    return json(res, 200, { ok: true, activeUser: admin })
+    const token = await taskflowSession(admin, body.remember !== false)
+    setSessionCookie(req, res, token, body.remember !== false ? SESSION_TTL / 1000 : 12 * 60 * 60)
+    return json(res, 200, { ok: true, activeUser: admin, token })
   }
   if (body.action !== 'login' || !/^\d{4,8}$/.test(body.pin || '')) {
     return json(res, 400, { error: 'Enter a valid 4–8 digit PIN.' })
@@ -519,8 +551,9 @@ async function handleAuth(req, res, url) {
     () => {},
     { actorId: activeUser.id, actorName: activeUser.name, action: 'auth.login' }
   )
-  setCookie(res, await taskflowSession(activeUser, remember), remember ? SESSION_TTL / 1000 : 12 * 60 * 60)
-  return json(res, 200, { ok: true, activeUser })
+  const token = await taskflowSession(activeUser, remember)
+  setSessionCookie(req, res, token, remember ? SESSION_TTL / 1000 : 12 * 60 * 60)
+  return json(res, 200, { ok: true, activeUser, token })
 }
 
 async function handleUsers(req, res, user) {
@@ -585,7 +618,7 @@ async function handleUsers(req, res, user) {
       pin,
       pinLookup: lookup,
       permissions: [...new Set(candidate.permissions.filter((permission) =>
-        ['dash', 'notices', 'meet', 'zoom', 'cal', 'kpi', 'day', 'tasks', 'clickup', 'projects', 'team', 'hr', 'foodics', 'gulf'].includes(permission)
+        ['dash', 'notices', 'mails', 'meet', 'zoom', 'cal', 'kpi', 'day', 'tasks', 'clickup', 'projects', 'team', 'hr', 'foodics', 'gulf', 'cashbank'].includes(permission)
       ))],
     })
   }
@@ -689,7 +722,50 @@ async function handleDocs(req, res, url, user) {
       (store) => {
         store.documents[target.collection] ||= {}
         const current = store.documents[target.collection][target.id]?.data || {}
-        const data = method === 'PATCH' ? { ...current, ...body.data } : body.data
+        let data = method === 'PATCH' ? { ...current, ...body.data } : body.data
+        if (method === 'PATCH' && target.collection.toLowerCase() === 'cashbankaccounting' && target.id === 'main') {
+          const mergeById = (existing, incoming, timestamp) => {
+            const merged = new Map((Array.isArray(existing) ? existing : []).map((item) => [item.id, item]))
+            for (const item of Array.isArray(incoming) ? incoming : []) {
+              const previous = merged.get(item.id)
+              if (!previous || Date.parse(item[timestamp] || item.createdAt || '') >= Date.parse(previous[timestamp] || previous.createdAt || '')) {
+                merged.set(item.id, item)
+              }
+            }
+            return [...merged.values()]
+          }
+          const sequences = { ...(current.sequences || {}), ...(body.data.sequences || {}) }
+          for (const [key, sequence] of Object.entries(body.data.sequences || {})) {
+            sequences[key] = Math.max(Number(current.sequences?.[key]) || 0, Number(sequence) || 0)
+          }
+          const events = new Map()
+          for (const event of [...(current.audit || []), ...(body.data.audit || [])]) {
+            const key = `${event.documentId || ''}:${event.action || ''}:${event.at || ''}`
+            events.set(key, event)
+          }
+          data = {
+            ...data,
+            sequences,
+            notes: mergeById(current.notes, body.data.notes, 'updatedAt'),
+            audit: [...events.values()],
+          }
+        }
+        if (method === 'PATCH' && target.collection === 'gulf' && target.id === 'main') {
+          for (const key of ['nodes', 'assets', 'contacts']) {
+            if (!Array.isArray(body.data[key])) continue
+            const keyFor = key === 'contacts' ? (item) => item.email?.toLowerCase() : (item) => item.id
+            const merged = new Map(
+              (Array.isArray(current[key]) ? current[key] : [])
+                .filter((item) => item && typeof keyFor(item) === 'string')
+                .map((item) => [keyFor(item), item])
+            )
+            for (const item of body.data[key]) {
+              const itemKey = item && typeof keyFor(item) === 'string' ? keyFor(item) : null
+              if (itemKey) merged.set(itemKey, item)
+            }
+            data[key] = [...merged.values()]
+          }
+        }
         store.documents[target.collection][target.id] = { data, updatedAt: new Date().toISOString() }
         return data
       },
@@ -751,6 +827,48 @@ async function handleDocs(req, res, url, user) {
   return json(res, 405, { error: 'Method not allowed.' }, { Allow: 'GET, PUT, PATCH, POST, DELETE' })
 }
 
+async function handleCashBankSequence(req, res, user) {
+  if (!user.isAdmin && !user.permissions?.includes('cashbank')) {
+    return json(res, 403, { error: 'Your account does not have access to Cash & Bank.' })
+  }
+  if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed.' }, { Allow: 'POST' })
+  const body = await jsonBody(req)
+  if (
+    !['credit', 'debit'].includes(body.kind) ||
+    typeof body.year !== 'string' ||
+    !/^\d{4}$/.test(body.year) ||
+    !Number.isInteger(body.count) ||
+    body.count < 1 ||
+    body.count > 100
+  ) {
+    return json(res, 400, { error: 'A valid adjustment kind, year, and count from 1 to 100 are required.' })
+  }
+  const sequenceKey = `${body.kind}-${body.year}`
+  const result = await updateStore(
+    (store) => {
+      store.documents.cashbankAccounting ||= {}
+      const current = store.documents.cashbankAccounting.main?.data || { notes: [], sequences: {}, audit: [] }
+      const first = (Number(current.sequences?.[sequenceKey]) || 0) + 1
+      const last = first + body.count - 1
+      const data = {
+        ...current,
+        sequences: { ...(current.sequences || {}), [sequenceKey]: last },
+      }
+      store.documents.cashbankAccounting.main = { data, updatedAt: new Date().toISOString() }
+      return { sequenceKey, first, last }
+    },
+    {
+      actorId: user.id,
+      actorName: user.name,
+      action: 'cashbank.sequence.reserve',
+      collection: 'cashbankAccounting',
+      documentId: 'main',
+      details: { kind: body.kind, year: body.year, count: body.count },
+    }
+  )
+  return json(res, 200, result)
+}
+
 async function handleFileUpload(req, res, user, scope) {
   if (process.env.DATABASE_URL) {
     const body = await jsonBody(req)
@@ -771,7 +889,7 @@ async function handleFileUpload(req, res, user, scope) {
           typeof payload.name !== 'string' ||
           !payload.name.trim() ||
           payload.name.length > 255 ||
-          !['config', 'foodics', 'gulf', 'hr'].includes(scope) ||
+          !['config', 'foodics', 'gulf', 'hr', 'cashbank'].includes(scope) ||
           !user ||
           !canAccess(user, scope, 'POST')
         ) {
@@ -816,7 +934,7 @@ async function handleFileUpload(req, res, user, scope) {
     })
     return json(res, 200, result)
   }
-  if (!['config', 'foodics', 'gulf', 'hr'].includes(scope)) {
+  if (!['config', 'foodics', 'gulf', 'hr', 'cashbank'].includes(scope)) {
     return json(res, 400, { error: 'Choose a supported file collection.' })
   }
   if (!canAccess(user, scope, 'POST')) return json(res, 403, { error: 'Your account does not have access to upload here.' })
@@ -939,7 +1057,6 @@ async function handleMeetings(req, res, parsedBody, user) {
     ...body,
     id,
     status: 'scheduled',
-    joinUrl: body.platform === 'google' ? 'https://meet.google.com/new' : 'https://zoom.us/start/videomeeting',
     createdAt: new Date().toISOString(),
   }
   await updateStore(
@@ -1137,6 +1254,14 @@ async function handleRequest(req, res) {
   res.setHeader('X-Frame-Options', 'DENY')
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
   const pathname = url.pathname
+  if (req.headers.origin && !allowedOrigin(req)) {
+    return json(res, 403, { error: 'Request origin is not allowed.' })
+  }
+  applyCors(req, res)
+  if (req.method === 'OPTIONS' && pathname.startsWith('/api/')) {
+    res.writeHead(204)
+    return res.end()
+  }
   if (pathname === '/api/health') {
     if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed.' }, { Allow: 'GET' })
     await openDatabase()
@@ -1150,7 +1275,7 @@ async function handleRequest(req, res) {
         return await handleFileUpload(req, res, null, url.searchParams.get('scope') || '')
       }
     }
-    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !validateOrigin(req)) {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !allowedOrigin(req)) {
       return json(res, 403, { error: 'Request origin is not allowed.' })
     }
     if (pathname === '/api/cron/gmail-watch') {
@@ -1178,6 +1303,7 @@ async function handleRequest(req, res) {
       return await handleMailRequest(req, res, url, user, { json, jsonBody, readStore, updateStore })
     }
     if (pathname === '/api/users') return await handleUsers(req, res, user)
+    if (pathname === '/api/cashbank/sequences') return await handleCashBankSequence(req, res, user)
     if (pathname === '/api/docs') return await handleDocs(req, res, url, user)
     if (pathname === '/api/dashboard/ceo') return await handleCeoDashboard(req, res, url, user)
     if (pathname === '/api/audit') {

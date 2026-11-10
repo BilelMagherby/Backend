@@ -23,7 +23,7 @@ cd frontend
 npm run dev
 ```
 
-The Vite development server proxies `/api` requests to `http://localhost:8889`. Open the URL printed by Vite. On first use, create the dashboard admin PIN. The default frontend uses the shared backend database. Use `npm run dev:frontend-only` in the frontend folder only when you intentionally want isolated browser-only demo storage.
+The Vite development server proxies `/api` requests to `http://localhost:8889`. Open the URL printed by Vite. On first use, create the dashboard admin PIN. TaskFlow and Cash & Bank require the backend; there is no browser-only persistence mode.
 
 Run the backend tests with:
 
@@ -35,7 +35,7 @@ npm test
 
 Import the backend repository into Vercel and set its **Root Directory** to the repository root. Use the **Other** framework preset and leave the build command and output directory empty. Vercel serves `/api/*` through `api/[...path].js`. `src/server.js` also exports a default request handler for Vercel configurations that select that file directly.
 
-Add `DATABASE_URL` and `BLOB_READ_WRITE_TOKEN` to the Vercel project's Production environment (and Preview/Development if those deployments need the service). `DATABASE_URL` must point to a Postgres database, and the Blob token must belong to a private Vercel Blob store. The deployment's health check is available at `/api/health`.
+Add `DATABASE_URL`, `BLOB_READ_WRITE_TOKEN`, and `FRONTEND_ORIGINS` to the Vercel project's Production environment (and Preview/Development if those deployments need the service). `DATABASE_URL` must point to a Postgres database, the Blob token must belong to a private Vercel Blob store, and `FRONTEND_ORIGINS` must contain the exact browser-facing frontend origin (for example `https://app.example.com`, without a trailing slash). The API allows credentialed CORS only for this configured origin and its own host. The deployment's health check is available at `/api/health`.
 
 ## Data and configuration
 
@@ -58,6 +58,7 @@ Copy `.env.example` to `.env` to configure the service. Important options:
 | `BLOB_READ_WRITE_TOKEN` | unset | Required with `DATABASE_URL`; read/write access to the private Vercel Blob store |
 | `CRON_SECRET` | unset | Required to authorize Vercel's daily Gmail watch-renewal cron when Gmail Pub/Sub is enabled |
 | `PIN_LOOKUP_SECRET` | unset | Optional secret to speed role PIN lookup for larger teams; keep it stable |
+| `FRONTEND_ORIGINS` | unset | Comma-separated exact browser frontend origins allowed by credentialed CORS |
 | `CLICKUP_API_TOKEN` | unset | Optional server-only ClickUp token |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | unset | Google OAuth web client; keep the secret in the backend `.env` only |
 | `GOOGLE_REDIRECT_URI` | `http://localhost:8889/api/mails/auth/google/callback` | OAuth callback URL registered with Google |
@@ -69,7 +70,7 @@ Copy `.env.example` to `.env` to configure the service. Important options:
 | `MAILS_PUBSUB_AUDIENCE` | unset | Optional exact audience expected in Pub/Sub OIDC tokens |
 | `MAILS_PUBSUB_SERVICE_ACCOUNT` | unset | Optional service account email used to authenticate Pub/Sub push |
 
-The server stores PINs as salted scrypt hashes. Session cookies are HttpOnly and SameSite strict; in-memory sessions are cleared when the backend restarts. Login attempts are rate limited. Uploaded files are limited to 100 MB each.
+The server stores PINs as salted scrypt hashes. Session cookies are HttpOnly; trusted cross-origin frontend requests use `SameSite=None; Secure`, with bearer-session authorization as a fallback. In-memory sessions are cleared when the backend restarts. Login attempts are rate limited. Uploaded files are limited to 100 MB each.
 
 ## Gmail Mails
 

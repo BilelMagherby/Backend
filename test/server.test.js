@@ -12,12 +12,13 @@ let uploadDir
 let adminCookie
 let createAppServer
 
-async function call(route, { method = 'GET', body, cookie, origin } = {}) {
+async function call(route, { method = 'GET', body, cookie, token, origin } = {}) {
   const response = await fetch(`${baseUrl}${route}`, {
     method,
     headers: {
       ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       ...(cookie ? { Cookie: cookie } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(origin ? { Origin: origin } : {}),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -43,6 +44,7 @@ before(async () => {
   )
   process.env.DATA_DIR = dataDir
   process.env.UPLOAD_DIR = uploadDir
+  process.env.FRONTEND_ORIGINS = 'https://frontend.example'
   ;({ createAppServer } = await import('../src/server.js'))
   server = createAppServer()
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -55,6 +57,7 @@ after(async () => {
   await rm(uploadDir, { recursive: true, force: true })
   delete process.env.DATA_DIR
   delete process.env.UPLOAD_DIR
+  delete process.env.FRONTEND_ORIGINS
 })
 
 test('requires authentication and configures the admin PIN once', async () => {
@@ -83,6 +86,128 @@ test('requires authentication and configures the admin PIN once', async () => {
   assert.equal(duplicateSetup.response.status, 409)
   const preservedLegacyFile = JSON.parse(await readFile(path.join(dataDir, 'store.json'), 'utf8'))
   assert.equal(preservedLegacyFile.documents.tasks.migrated.data.title, 'Imported from previous backend')
+})
+
+test('allows authenticated API requests from the configured frontend origin', async () => {
+  const login = await call('/api/auth', {
+    method: 'POST',
+    origin: 'https://frontend.example',
+    body: { action: 'login', pin: '123456', remember: false },
+  })
+  assert.equal(login.response.status, 200)
+  assert.equal(login.response.headers.get('access-control-allow-origin'), 'https://frontend.example')
+  assert.match(login.response.headers.get('set-cookie'), /SameSite=None;.*Secure/)
+  assert.ok(login.body.token)
+
+  const protectedResponse = await call('/api/docs?collection=tasks', {
+    origin: 'https://frontend.example',
+    token: login.body.token,
+  })
+  assert.equal(protectedResponse.response.status, 200)
+
+  const preflight = await fetch(`${baseUrl}/api/docs`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'https://frontend.example',
+      'Access-Control-Request-Method': 'PATCH',
+      'Access-Control-Request-Headers': 'authorization,content-type',
+    },
+  })
+  assert.equal(preflight.status, 204)
+  assert.equal(preflight.headers.get('access-control-allow-origin'), 'https://frontend.example')
+
+  const denied = await call('/api/auth', { origin: 'https://untrusted.example' })
+  assert.equal(denied.response.status, 403)
+})
+
+test('reserves Cash & Bank adjustment numbers atomically', async () => {
+  const first = await call('/api/cashbank/sequences', {
+    method: 'POST',
+    cookie: adminCookie,
+    body: { kind: 'credit', year: '2026', count: 2 },
+  })
+  const second = await call('/api/cashbank/sequences', {
+    method: 'POST',
+    cookie: adminCookie,
+    body: { kind: 'credit', year: '2026', count: 1 },
+  })
+  assert.equal(first.response.status, 200)
+  assert.deepEqual(first.body, { sequenceKey: 'credit-2026', first: 1, last: 2 })
+  assert.deepEqual(second.body, { sequenceKey: 'credit-2026', first: 3, last: 3 })
+})
+
+test('merges concurrent Cash & Bank and Natheel Gulf additions', async () => {
+  const firstNote = {
+    id: 'CN-2026-0001',
+    kind: 'credit',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  }
+  await call('/api/docs', {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: {
+      path: 'cashbankAccounting/main',
+      data: { notes: [firstNote], sequences: { 'credit-2026': 3 }, audit: [] },
+    },
+  })
+  const secondNote = {
+    id: 'CN-2026-0002',
+    kind: 'credit',
+    createdAt: '2026-01-02T00:00:00.000Z',
+    updatedAt: '2026-01-02T00:00:00.000Z',
+  }
+  await call('/api/docs', {
+    method: 'PATCH',
+    cookie: adminCookie,
+    body: {
+      path: 'cashbankAccounting/main',
+      data: { notes: [firstNote, secondNote], sequences: { 'credit-2026': 1 }, audit: [] },
+    },
+  })
+  const accounting = await call('/api/docs?path=cashbankAccounting%2Fmain', { cookie: adminCookie })
+  assert.equal(accounting.body.data.notes.length, 2)
+  assert.equal(accounting.body.data.sequences['credit-2026'], 3)
+
+  await call('/api/docs', {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: {
+      path: 'gulf/main',
+      data: { nodes: [], assets: [{ id: 'asset-1' }], contacts: [{ name: 'First', email: 'first@example.com' }] },
+    },
+  })
+  await call('/api/docs', {
+    method: 'PATCH',
+    cookie: adminCookie,
+    body: {
+      path: 'gulf/main',
+      data: {
+        assets: [{ id: 'asset-1' }, { id: 'asset-2' }],
+        contacts: [{ name: 'First', email: 'first@example.com' }, { name: 'Second', email: 'second@example.com' }],
+      },
+    },
+  })
+  await call('/api/docs', {
+    method: 'PATCH',
+    cookie: adminCookie,
+    body: {
+      path: 'gulf/main',
+      data: {
+        assets: [{ id: 'asset-1' }, { id: 'asset-3' }],
+        contacts: [
+          { name: 'First', email: 'first@example.com' },
+          { name: 'Third', email: 'third@example.com' },
+        ],
+      },
+    },
+  })
+  const gulf = await call('/api/docs?path=gulf%2Fmain', { cookie: adminCookie })
+  assert.deepEqual(gulf.body.data.assets.map((asset) => asset.id).sort(), ['asset-1', 'asset-2', 'asset-3'])
+  assert.deepEqual(
+    gulf.body.data.contacts.map((contact) => contact.email).sort(),
+    ['first@example.com', 'second@example.com', 'third@example.com']
+  )
 })
 
 test('keeps Gmail account state authenticated and binds OAuth state to the browser', async () => {
@@ -372,7 +497,7 @@ test('serves a filtered CEO dashboard aggregate only to CEO dashboard users', as
   await call('/api/users', { method: 'PUT', cookie: adminCookie, body: { users: [] } })
 })
 
-test('creates meetings and rejects malformed document paths', async () => {
+test('creates meetings without fabricated join links and rejects malformed document paths', async () => {
   const meeting = await call('/api/meetings', {
     method: 'POST',
     cookie: adminCookie,
@@ -380,7 +505,7 @@ test('creates meetings and rejects malformed document paths', async () => {
   })
   assert.equal(meeting.response.status, 201)
   assert.equal(meeting.body.meeting.title, 'Weekly sync')
-  assert.match(meeting.body.meeting.joinUrl, /^https:\/\/meet\.google\.com\//)
+  assert.equal(meeting.body.meeting.joinUrl, undefined)
 
   const invalidPath = await call('/api/docs?path=../../store.json', {
     method: 'DELETE',
@@ -414,20 +539,33 @@ test('creates role accounts whose section permissions are enforced server-side',
   const users = await call('/api/users', {
     method: 'PUT',
     cookie: adminCookie,
-    body: { users: [{ id: 'person-1', name: 'Team member', pin: '6789', permissions: ['hr', 'foodics'] }] },
+    body: { users: [{ id: 'person-1', name: 'Team member', pin: '6789', permissions: ['hr', 'foodics', 'cashbank', 'mails'] }] },
   })
   assert.equal(users.response.status, 200)
-  assert.deepEqual(users.body, [{ id: 'person-1', name: 'Team member', permissions: ['hr', 'foodics'] }])
+  assert.deepEqual(users.body, [{ id: 'person-1', name: 'Team member', permissions: ['hr', 'foodics', 'cashbank', 'mails'] }])
 
   const login = await call('/api/auth', {
     method: 'POST',
     body: { action: 'login', pin: '6789', remember: false },
   })
   assert.equal(login.response.status, 200)
-  assert.deepEqual(login.body.activeUser.permissions, ['hr', 'foodics'])
+  assert.deepEqual(login.body.activeUser.permissions, ['hr', 'foodics', 'cashbank', 'mails'])
 
   const allowed = await call('/api/docs?collection=hr', { cookie: login.cookie })
   assert.equal(allowed.response.status, 200)
+  assert.equal((await call('/api/docs?collection=cashbankPurchases', { cookie: login.cookie })).response.status, 200)
+  assert.equal((await call('/api/mails/status', { cookie: login.cookie })).response.status, 200)
+  const statementFile = new FormData()
+  statementFile.append('file', new Blob(['bank statement']), 'statement.csv')
+  const statementUpload = await fetch(`${baseUrl}/api/files?scope=cashbank`, {
+    method: 'POST',
+    headers: { Cookie: login.cookie },
+    body: statementFile,
+  })
+  assert.equal(statementUpload.status, 201)
+  const uploadedStatement = await statementUpload.json()
+  assert.equal((await fetch(`${baseUrl}${uploadedStatement.url}`, { headers: { Cookie: login.cookie } })).status, 200)
+  assert.equal((await call(uploadedStatement.url, { method: 'DELETE', cookie: login.cookie })).response.status, 200)
   const hrForm = new FormData()
   hrForm.append('file', new Blob(['private HR document']), 'employee-contract.txt')
   const hrUpload = await fetch(`${baseUrl}/api/files?scope=hr`, {
@@ -494,6 +632,7 @@ test('notices permission exposes operational task and meeting notices without HR
   assert.equal((await call('/api/docs?collection=tasks', { cookie: login.cookie })).response.status, 200)
   assert.equal((await call('/api/docs?collection=meetings', { cookie: login.cookie })).response.status, 200)
   assert.equal((await call('/api/docs?collection=hr', { cookie: login.cookie })).response.status, 403)
+  assert.equal((await call('/api/docs?collection=cashbankPurchases', { cookie: login.cookie })).response.status, 403)
 })
 
 test('keeps records and the audit log after restarting the backend', async () => {
