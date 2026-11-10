@@ -1,6 +1,6 @@
 # TaskFlow Node.js backend
 
-The backend is a dependency-free Node.js HTTP service for the dashboard. It provides PIN authentication, role permissions, persistent dashboard data, a change log, ClickUp snapshots, and protected file storage.
+The backend is a Node.js HTTP service for the dashboard. It provides PIN authentication, role permissions, persistent dashboard data, a change log, ClickUp snapshots, and protected file storage.
 
 ## Requirements
 
@@ -30,6 +30,12 @@ Run the backend tests with:
 ```powershell
 npm test
 ```
+
+## Deploy to Vercel
+
+Import the backend repository into Vercel and set its **Root Directory** to the repository root. Use the **Other** framework preset and leave the build command and output directory empty. Vercel serves `/api/*` through `api/[...path].js`; do not configure `src/server.js` as a function entrypoint.
+
+Add `DATABASE_URL` and `BLOB_READ_WRITE_TOKEN` to the Vercel project's Production environment (and Preview/Development if those deployments need the service). `DATABASE_URL` must point to a Postgres database, and the Blob token must belong to a private Vercel Blob store. The deployment's health check is available at `/api/health`.
 
 ## Data and configuration
 
