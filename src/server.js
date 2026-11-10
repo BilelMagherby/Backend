@@ -434,14 +434,21 @@ function sameHostOrigin(req) {
   }
 }
 
+const DEFAULT_FRONTEND_ORIGINS = [
+  'https://www.natheelcoo.com',
+  'https://natheelcoo.com',
+  'https://frontend-coral-ten-91.vercel.app',
+]
+
 function allowedOrigin(req) {
   const origin = req.headers.origin
   if (!origin) return true
   if (sameHostOrigin(req)) return true
-  const allowedOrigins = (process.env.FRONTEND_ORIGINS || '')
+  const configuredOrigins = (process.env.FRONTEND_ORIGINS || '')
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean)
+  const allowedOrigins = [...new Set([...DEFAULT_FRONTEND_ORIGINS, ...configuredOrigins])]
   return allowedOrigins.includes(origin)
 }
 
