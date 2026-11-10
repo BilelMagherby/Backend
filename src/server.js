@@ -1257,6 +1257,8 @@ export async function handleVercelRequest(req, res) {
   }
 }
 
+export default handleVercelRequest
+
 export function createAppServer() {
   let stopMailWatchRenewal
   const server = createServer((req, res) => {

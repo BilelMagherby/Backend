@@ -33,7 +33,7 @@ npm test
 
 ## Deploy to Vercel
 
-Import the backend repository into Vercel and set its **Root Directory** to the repository root. Use the **Other** framework preset and leave the build command and output directory empty. Vercel serves `/api/*` through `api/[...path].js`; do not configure `src/server.js` as a function entrypoint.
+Import the backend repository into Vercel and set its **Root Directory** to the repository root. Use the **Other** framework preset and leave the build command and output directory empty. Vercel serves `/api/*` through `api/[...path].js`. `src/server.js` also exports a default request handler for Vercel configurations that select that file directly.
 
 Add `DATABASE_URL` and `BLOB_READ_WRITE_TOKEN` to the Vercel project's Production environment (and Preview/Development if those deployments need the service). `DATABASE_URL` must point to a Postgres database, and the Blob token must belong to a private Vercel Blob store. The deployment's health check is available at `/api/health`.
 
