@@ -817,10 +817,14 @@ async function handleDocs(req, res, url, user) {
   }
 
   if (method === 'POST') {
-    if (!collection || !canAccess(user, collection, method)) {
-      return json(res, collection ? 403 : 400, { error: collection ? 'Your account does not have access to this data.' : 'Specify a collection.' })
-    }
     const body = await jsonBody(req)
+    const targetCollection = collection || (typeof body.collection === 'string' ? body.collection : '')
+    if (!targetCollection || !SAFE_COLLECTION.test(targetCollection)) {
+      return json(res, 400, { error: 'Specify a collection.' })
+    }
+    if (!canAccess(user, targetCollection, method)) {
+      return json(res, 403, { error: 'Your account does not have access to this data.' })
+    }
     if (!Array.isArray(body.items) || body.items.length > 500) {
       return json(res, 400, { error: 'Items must be an array of at most 500 documents.' })
     }
@@ -831,12 +835,12 @@ async function handleDocs(req, res, url, user) {
     }
     await updateStore(
       (store) => {
-        store.documents[collection] ||= {}
+        store.documents[targetCollection] ||= {}
         for (const item of body.items) {
-          store.documents[collection][item.id] = { data: item.data, updatedAt: new Date().toISOString() }
+          store.documents[targetCollection][item.id] = { data: item.data, updatedAt: new Date().toISOString() }
         }
       },
-      { actorId: user.id, actorName: user.name, action: 'batch.create', collection, details: { count: body.items.length } }
+      { actorId: user.id, actorName: user.name, action: 'batch.create', collection: targetCollection, details: { count: body.items.length } }
     )
     return json(res, 200, { saved: body.items.length })
   }
