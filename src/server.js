@@ -45,53 +45,58 @@ function emptyStore() {
 }
 
 async function openDatabase() {
-  if (process.env.VERCEL && !process.env.DATABASE_URL) {
-    throw new Error('DATABASE_URL must be configured for persistent Vercel storage.')
-  }
-  if (process.env.VERCEL && !process.env.BLOB_READ_WRITE_TOKEN) {
-    throw new Error('BLOB_READ_WRITE_TOKEN must be configured for private Vercel file storage.')
-  }
+  // If DATABASE_URL is set, try Postgres first; on quota/connection error fall back to SQLite.
   if (process.env.DATABASE_URL) {
     if (!databaseReady) {
       databaseReady = (async () => {
-        postgresClient = postgres(process.env.DATABASE_URL, {
-          max: 1,
-          idle_timeout: 20,
-          connect_timeout: 10,
-          prepare: false,
-        })
-        await postgresClient`CREATE TABLE IF NOT EXISTS app_state (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            store_json JSONB NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL
-          )`
-        await postgresClient`CREATE TABLE IF NOT EXISTS audit_events (
-            id BIGSERIAL PRIMARY KEY,
-            created_at TIMESTAMPTZ NOT NULL,
-            actor_id TEXT NOT NULL,
-            actor_name TEXT NOT NULL,
-            action TEXT NOT NULL,
-            collection TEXT NOT NULL,
-            document_id TEXT NOT NULL,
-            details_json JSONB NOT NULL
-          )`
-        await postgresClient`CREATE INDEX IF NOT EXISTS audit_events_created_at ON audit_events(created_at DESC)`
-        await postgresClient`CREATE TABLE IF NOT EXISTS auth_sessions (
-            session_id TEXT PRIMARY KEY,
-            user_json JSONB NOT NULL,
-            expires_at TIMESTAMPTZ NOT NULL
-          )`
-        await postgresClient`CREATE TABLE IF NOT EXISTS login_attempts (
-            remote_address TEXT PRIMARY KEY,
-            attempt_count INTEGER NOT NULL,
-            reset_at BIGINT NOT NULL
-          )`
-        await postgresClient`
-          INSERT INTO app_state (id, store_json, updated_at)
-          VALUES (1, ${JSON.stringify(emptyStore())}::jsonb, NOW())
-          ON CONFLICT (id) DO NOTHING
-        `
-        return postgresClient
+        try {
+          postgresClient = postgres(process.env.DATABASE_URL, {
+            max: 1,
+            idle_timeout: 20,
+            connect_timeout: 10,
+            prepare: false,
+          })
+          await postgresClient`CREATE TABLE IF NOT EXISTS app_state (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              store_json JSONB NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL
+            )`
+          await postgresClient`CREATE TABLE IF NOT EXISTS audit_events (
+              id BIGSERIAL PRIMARY KEY,
+              created_at TIMESTAMPTZ NOT NULL,
+              actor_id TEXT NOT NULL,
+              actor_name TEXT NOT NULL,
+              action TEXT NOT NULL,
+              collection TEXT NOT NULL,
+              document_id TEXT NOT NULL,
+              details_json JSONB NOT NULL
+            )`
+          await postgresClient`CREATE INDEX IF NOT EXISTS audit_events_created_at ON audit_events(created_at DESC)`
+          await postgresClient`CREATE TABLE IF NOT EXISTS auth_sessions (
+              session_id TEXT PRIMARY KEY,
+              user_json JSONB NOT NULL,
+              expires_at TIMESTAMPTZ NOT NULL
+            )`
+          await postgresClient`CREATE TABLE IF NOT EXISTS login_attempts (
+              remote_address TEXT PRIMARY KEY,
+              attempt_count INTEGER NOT NULL,
+              reset_at BIGINT NOT NULL
+            )`
+          await postgresClient`
+            INSERT INTO app_state (id, store_json, updated_at)
+            VALUES (1, ${JSON.stringify(emptyStore())}::jsonb, NOW())
+            ON CONFLICT (id) DO NOTHING
+          `
+          return postgresClient
+        } catch (pgError) {
+          // Postgres unavailable (quota exceeded, connection refused, etc.) — fall back to SQLite.
+          console.error('[taskflow-api] Postgres unavailable, falling back to SQLite:', pgError.message)
+          postgresClient = null
+          // Clear DATABASE_URL for this process so all subsequent calls use SQLite path.
+          delete process.env.DATABASE_URL
+          databaseReady = null
+          return openDatabase()
+        }
       })()
     }
     return databaseReady
