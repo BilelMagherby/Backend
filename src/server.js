@@ -10,6 +10,7 @@ import { del as deleteBlob, get as getBlob, head as getBlobMetadata } from '@ver
 import { handleUpload as handleBlobUpload } from '@vercel/blob/client'
 import postgres from 'postgres'
 import { buildCeoDashboard } from './ceo-dashboard.js'
+import { handleHrEmployeesRequest } from './hr/employees.js'
 import {
   handleMailOAuthCallback,
   handleMailPush,
@@ -1344,6 +1345,9 @@ async function handleRequest(req, res) {
     }
     if (pathname === '/api/users') return await handleUsers(req, res, user)
     if (pathname === '/api/cashbank/sequences') return await handleCashBankSequence(req, res, user)
+    if (pathname === '/api/hr/employees' || pathname.startsWith('/api/hr/employees/')) {
+      return await handleHrEmployeesRequest(req, res, url, user, { readStore, updateStore, json, jsonBody })
+    }
     if (pathname === '/api/docs') return await handleDocs(req, res, url, user)
     if (pathname === '/api/dashboard/ceo') return await handleCeoDashboard(req, res, url, user)
     if (pathname === '/api/audit') {

@@ -654,3 +654,124 @@ test('keeps records and the audit log after restarting the backend', async () =>
   assert.equal(audit.response.status, 200)
   assert.ok(audit.body.some((event) => event.action === 'auth.login'))
 })
+
+test('provides complete HR employee CRUD, duplicate serial prevention, and batch import', async () => {
+  // 1. Create employee
+  const created = await call('/api/hr/employees', {
+    method: 'POST',
+    cookie: adminCookie,
+    body: {
+      firstName: 'Ahmed',
+      lastName: 'Al-Mansour',
+      serialNumber: 'EMP-001',
+      dob: '1990-05-15',
+      email: 'ahmed.mansour@natheelco.com',
+      phone: '+966501234567',
+      nationality: 'Saudi',
+      position: 'Senior Operations Manager',
+      department: 'Operations',
+      monthlySalary: 15000,
+      annualSalary: 180000,
+      status: 'Active',
+      company: 'Natheelco',
+      branch: 'Riyadh HQ',
+    },
+  })
+  assert.equal(created.response.status, 201)
+  assert.equal(created.body.employee.data.name, 'Ahmed Al-Mansour')
+  assert.equal(created.body.employee.data.serialNumber, 'EMP-001')
+  const employeeId = created.body.employee.id
+
+  // 2. Reject duplicate serial number
+  const duplicate = await call('/api/hr/employees', {
+    method: 'POST',
+    cookie: adminCookie,
+    body: {
+      firstName: 'Sara',
+      lastName: 'Hassan',
+      serialNumber: 'EMP-001', // duplicate!
+      dob: '1995-02-10',
+      email: 'sara.hassan@natheelco.com',
+    },
+  })
+  assert.equal(duplicate.response.status, 400)
+  assert.match(duplicate.body.error, /already in use/i)
+
+  // 3. Search and fetch employees
+  const list = await call('/api/hr/employees?search=Ahmed', { cookie: adminCookie })
+  assert.equal(list.response.status, 200)
+  assert.equal(list.body.employees.length, 1)
+  assert.equal(list.body.stats.active, 1)
+
+  // 4. Update employee
+  const updated = await call(`/api/hr/employees/${employeeId}`, {
+    method: 'PUT',
+    cookie: adminCookie,
+    body: {
+      position: 'Director of Operations',
+      monthlySalary: 18000,
+      annualSalary: 216000,
+    },
+  })
+  assert.equal(updated.response.status, 200)
+  assert.equal(updated.body.employee.data.position, 'Director of Operations')
+
+  // 5. Add document metadata
+  const docAdded = await call(`/api/hr/employees/${employeeId}/documents`, {
+    method: 'POST',
+    cookie: adminCookie,
+    body: {
+      fileId: '0123456789abcdef0123456789abcdef0123',
+      name: 'Passport_Copy.pdf',
+      category: 'Passport',
+      size: 1048576,
+      type: 'application/pdf',
+    },
+  })
+  assert.equal(docAdded.response.status, 201)
+  assert.equal(docAdded.body.document.name, 'Passport_Copy.pdf')
+  const docId = docAdded.body.document.id
+
+  // 6. Delete document metadata
+  const docRemoved = await call(`/api/hr/employees/${employeeId}/documents/${docId}`, {
+    method: 'DELETE',
+    cookie: adminCookie,
+  })
+  assert.equal(docRemoved.response.status, 200)
+
+  // 7. Batch import
+  const batchImport = await call('/api/hr/employees/import', {
+    method: 'POST',
+    cookie: adminCookie,
+    body: {
+      employees: [
+        {
+          firstName: 'Fatima',
+          lastName: 'Zahra',
+          serialNumber: 'EMP-002',
+          dob: '1992-08-20',
+          email: 'fatima@natheelco.com',
+          monthlySalary: 12000,
+          status: 'Active',
+        },
+        {
+          firstName: 'Invalid',
+          lastName: 'Duplicate',
+          serialNumber: 'EMP-001', // duplicate with Ahmed
+          dob: '1990-01-01',
+          email: 'invalid@natheelco.com',
+        },
+      ],
+    },
+  })
+  assert.equal(batchImport.response.status, 200)
+  assert.equal(batchImport.body.importedCount, 1)
+  assert.equal(batchImport.body.failedCount, 1)
+
+  // 8. Delete employee
+  const deleted = await call(`/api/hr/employees/${employeeId}`, {
+    method: 'DELETE',
+    cookie: adminCookie,
+  })
+  assert.equal(deleted.response.status, 200)
+})
