@@ -20,8 +20,8 @@ import {
 } from './mails/gmail.js'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const DATA_DIR = process.env.DATA_DIR ? path.resolve(ROOT, process.env.DATA_DIR) : path.join(ROOT, 'data')
-const UPLOAD_DIR = process.env.UPLOAD_DIR ? path.resolve(ROOT, process.env.UPLOAD_DIR) : path.join(ROOT, 'uploads')
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(ROOT, process.env.DATA_DIR) : (process.env.VERCEL ? '/tmp/taskflow-data' : path.join(ROOT, 'data'))
+const UPLOAD_DIR = process.env.UPLOAD_DIR ? path.resolve(ROOT, process.env.UPLOAD_DIR) : (process.env.VERCEL ? '/tmp/taskflow-uploads' : path.join(ROOT, 'uploads'))
 const DATABASE_FILE = path.join(DATA_DIR, 'taskflow.sqlite')
 const LEGACY_STORE_FILE = path.join(DATA_DIR, 'store.json')
 const SESSION_TTL = 30 * 24 * 60 * 60 * 1000
@@ -46,7 +46,7 @@ function emptyStore() {
 
 async function openDatabase() {
   if (process.env.VERCEL && !process.env.DATABASE_URL) {
-    throw new Error('DATABASE_URL must be configured for persistent Vercel storage.')
+    console.warn('[taskflow-api] Running on Vercel without DATABASE_URL; using SQLite in /tmp.')
   }
   if (process.env.VERCEL && !process.env.BLOB_READ_WRITE_TOKEN) {
     throw new Error('BLOB_READ_WRITE_TOKEN must be configured for private Vercel file storage.')
@@ -54,44 +54,52 @@ async function openDatabase() {
   if (process.env.DATABASE_URL) {
     if (!databaseReady) {
       databaseReady = (async () => {
-        postgresClient = postgres(process.env.DATABASE_URL, {
-          max: 1,
-          idle_timeout: 20,
-          connect_timeout: 10,
-          prepare: false,
-        })
-        await postgresClient`CREATE TABLE IF NOT EXISTS app_state (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            store_json JSONB NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL
-          )`
-        await postgresClient`CREATE TABLE IF NOT EXISTS audit_events (
-            id BIGSERIAL PRIMARY KEY,
-            created_at TIMESTAMPTZ NOT NULL,
-            actor_id TEXT NOT NULL,
-            actor_name TEXT NOT NULL,
-            action TEXT NOT NULL,
-            collection TEXT NOT NULL,
-            document_id TEXT NOT NULL,
-            details_json JSONB NOT NULL
-          )`
-        await postgresClient`CREATE INDEX IF NOT EXISTS audit_events_created_at ON audit_events(created_at DESC)`
-        await postgresClient`CREATE TABLE IF NOT EXISTS auth_sessions (
-            session_id TEXT PRIMARY KEY,
-            user_json JSONB NOT NULL,
-            expires_at TIMESTAMPTZ NOT NULL
-          )`
-        await postgresClient`CREATE TABLE IF NOT EXISTS login_attempts (
-            remote_address TEXT PRIMARY KEY,
-            attempt_count INTEGER NOT NULL,
-            reset_at BIGINT NOT NULL
-          )`
-        await postgresClient`
-          INSERT INTO app_state (id, store_json, updated_at)
-          VALUES (1, ${JSON.stringify(emptyStore())}::jsonb, NOW())
-          ON CONFLICT (id) DO NOTHING
-        `
-        return postgresClient
+        try {
+          postgresClient = postgres(process.env.DATABASE_URL, {
+            max: 1,
+            idle_timeout: 20,
+            connect_timeout: 10,
+            prepare: false,
+          })
+          await postgresClient`CREATE TABLE IF NOT EXISTS app_state (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              store_json JSONB NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL
+            )`
+          await postgresClient`CREATE TABLE IF NOT EXISTS audit_events (
+              id BIGSERIAL PRIMARY KEY,
+              created_at TIMESTAMPTZ NOT NULL,
+              actor_id TEXT NOT NULL,
+              actor_name TEXT NOT NULL,
+              action TEXT NOT NULL,
+              collection TEXT NOT NULL,
+              document_id TEXT NOT NULL,
+              details_json JSONB NOT NULL
+            )`
+          await postgresClient`CREATE INDEX IF NOT EXISTS audit_events_created_at ON audit_events(created_at DESC)`
+          await postgresClient`CREATE TABLE IF NOT EXISTS auth_sessions (
+              session_id TEXT PRIMARY KEY,
+              user_json JSONB NOT NULL,
+              expires_at TIMESTAMPTZ NOT NULL
+            )`
+          await postgresClient`CREATE TABLE IF NOT EXISTS login_attempts (
+              remote_address TEXT PRIMARY KEY,
+              attempt_count INTEGER NOT NULL,
+              reset_at BIGINT NOT NULL
+            )`
+          await postgresClient`
+            INSERT INTO app_state (id, store_json, updated_at)
+            VALUES (1, ${JSON.stringify(emptyStore())}::jsonb, NOW())
+            ON CONFLICT (id) DO NOTHING
+          `
+          return postgresClient
+        } catch (error) {
+          console.error('[taskflow-api] Postgres unavailable (quota/connection). Falling back to SQLite:', error.message)
+          postgresClient = null
+          delete process.env.DATABASE_URL
+          databaseReady = null
+          return openDatabase()
+        }
       })()
     }
     return databaseReady
@@ -179,9 +187,21 @@ function parseStoreJson(value) {
 
 async function readStore() {
   const db = await openDatabase()
-  const row = process.env.DATABASE_URL
-    ? (await db`SELECT store_json FROM app_state WHERE id = 1`)[0]
-    : db.prepare('SELECT store_json FROM app_state WHERE id = 1').get()
+  let row
+  try {
+    row = process.env.DATABASE_URL
+      ? (await db`SELECT store_json FROM app_state WHERE id = 1`)[0]
+      : db.prepare('SELECT store_json FROM app_state WHERE id = 1').get()
+  } catch (error) {
+    if (process.env.DATABASE_URL && /quota|limit|connection/i.test(error.message)) {
+      console.error('[taskflow-api] Postgres quota exceeded on read. Falling back to SQLite:', error.message)
+      postgresClient = null
+      delete process.env.DATABASE_URL
+      databaseReady = null
+      return readStore()
+    }
+    throw error
+  }
   if (!row) throw new Error('TaskFlow database is missing its application state.')
   try {
     return parseStoreJson(row.store_json)
@@ -195,34 +215,45 @@ function updateStore(update, audit) {
   const operation = writeQueue.then(async () => {
     const db = await openDatabase()
     if (process.env.DATABASE_URL) {
-      return db.begin(async (transaction) => {
-        await transaction`SELECT pg_advisory_xact_lock(731904126)`
-        const [row] = await transaction`SELECT store_json FROM app_state WHERE id = 1 FOR UPDATE`
-        if (!row) throw new Error('TaskFlow database is missing its application state.')
-        const store = parseStoreJson(row.store_json)
-        const result = update(store)
-        const updatedAt = new Date().toISOString()
-        await transaction`
-          UPDATE app_state SET store_json = ${JSON.stringify(store)}::jsonb, updated_at = ${updatedAt}
-          WHERE id = 1
-        `
-        if (audit) {
+      try {
+        return await db.begin(async (transaction) => {
+          await transaction`SELECT pg_advisory_xact_lock(731904126)`
+          const [row] = await transaction`SELECT store_json FROM app_state WHERE id = 1 FOR UPDATE`
+          if (!row) throw new Error('TaskFlow database is missing its application state.')
+          const store = parseStoreJson(row.store_json)
+          const result = update(store)
+          const updatedAt = new Date().toISOString()
           await transaction`
-            INSERT INTO audit_events
-              (created_at, actor_id, actor_name, action, collection, document_id, details_json)
-            VALUES (
-              ${updatedAt},
-              ${String(audit.actorId || 'system')},
-              ${String(audit.actorName || 'System')},
-              ${String(audit.action)},
-              ${String(audit.collection || '')},
-              ${String(audit.documentId || '')},
-              ${JSON.stringify(audit.details || {})}::jsonb
-            )
+            UPDATE app_state SET store_json = ${JSON.stringify(store)}::jsonb, updated_at = ${updatedAt}
+            WHERE id = 1
           `
+          if (audit) {
+            await transaction`
+              INSERT INTO audit_events
+                (created_at, actor_id, actor_name, action, collection, document_id, details_json)
+              VALUES (
+                ${updatedAt},
+                ${String(audit.actorId || 'system')},
+                ${String(audit.actorName || 'System')},
+                ${String(audit.action)},
+                ${String(audit.collection || '')},
+                ${String(audit.documentId || '')},
+                ${JSON.stringify(audit.details || {})}::jsonb
+              )
+            `
+          }
+          return result
+        })
+      } catch (error) {
+        if (/quota|limit|connection/i.test(error.message)) {
+          console.error('[taskflow-api] Postgres quota exceeded on write. Falling back to SQLite:', error.message)
+          postgresClient = null
+          delete process.env.DATABASE_URL
+          databaseReady = null
+          return updateStore(update, audit)
         }
-        return result
-      })
+        throw error
+      }
     }
     db.exec('BEGIN IMMEDIATE')
     try {
