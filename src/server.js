@@ -24,12 +24,48 @@ const DATA_DIR = process.env.DATA_DIR ? path.resolve(ROOT, process.env.DATA_DIR)
 const UPLOAD_DIR = process.env.UPLOAD_DIR ? path.resolve(ROOT, process.env.UPLOAD_DIR) : (process.env.VERCEL ? '/tmp/taskflow-uploads' : path.join(ROOT, 'uploads'))
 const DATABASE_FILE = path.join(DATA_DIR, 'taskflow.sqlite')
 const LEGACY_STORE_FILE = path.join(DATA_DIR, 'store.json')
+const BUNDLED_STORE_FILE = path.join(ROOT, 'data', 'store.json')
 const SESSION_TTL = 30 * 24 * 60 * 60 * 1000
 const JSON_LIMIT = 12 * 1024 * 1024
 const UPLOAD_LIMIT = 100 * 1024 * 1024
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,160}$/
 const SAFE_COLLECTION = /^[A-Za-z0-9_-]{1,80}$/
 const PIN_LOOKUP_SECRET = process.env.PIN_LOOKUP_SECRET || ''
+
+// SESSION_SECRET enables self-contained signed tokens that work across serverless restarts
+// even when Postgres is unavailable (Neon quota exceeded) so sessions never break with 401.
+const SESSION_SECRET =
+  process.env.SESSION_SECRET ||
+  process.env.PIN_LOOKUP_SECRET ||
+  process.env.CRON_SECRET ||
+  'natheelco-taskflow-fallback-key'
+
+// --- Self-signed token helpers ---
+// Token format: base64url(payload)|base64url(hmac)
+// payload = JSON {user, exp}  — no DB lookup required to verify
+
+function signToken(payload) {
+  const data = Buffer.from(JSON.stringify(payload)).toString('base64url')
+  const sig = createHmac('sha256', SESSION_SECRET).update(data).digest('base64url')
+  return `${data}.${sig}`
+}
+
+function verifyToken(token) {
+  const dot = token.lastIndexOf('.')
+  if (dot < 1) return null
+  const data = token.slice(0, dot)
+  const sig = token.slice(dot + 1)
+  const expected = createHmac('sha256', SESSION_SECRET).update(data).digest('base64url')
+  if (expected.length !== sig.length) return null
+  if (!timingSafeEqual(Buffer.from(expected), Buffer.from(sig))) return null
+  try {
+    return JSON.parse(Buffer.from(data, 'base64url').toString())
+  } catch {
+    return null
+  }
+}
+
+// In-memory sessions cache (best-effort; will be empty on cold starts)
 const sessions = new Map()
 const loginAttempts = new Map()
 let writeQueue = Promise.resolve()
@@ -129,20 +165,32 @@ async function openDatabase() {
           details_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS audit_events_created_at ON audit_events(created_at DESC);
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+          session_id TEXT PRIMARY KEY,
+          user_json TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS login_attempts (
+          remote_address TEXT PRIMARY KEY,
+          attempt_count INTEGER NOT NULL,
+          reset_at INTEGER NOT NULL
+        );
       `)
 
       const current = database.prepare('SELECT id FROM app_state WHERE id = 1').get()
       if (!current) {
         let initialStore = emptyStore()
-        try {
-          const previousStore = JSON.parse(await readFile(LEGACY_STORE_FILE, 'utf8'))
-          if (!previousStore || typeof previousStore !== 'object' || !previousStore.auth || !previousStore.documents) {
-            throw new Error('The previous backend data file has an invalid format.')
+        for (const candidateFile of [LEGACY_STORE_FILE, BUNDLED_STORE_FILE]) {
+          try {
+            const previousStore = JSON.parse(await readFile(candidateFile, 'utf8'))
+            if (previousStore && typeof previousStore === 'object' && previousStore.auth && previousStore.documents) {
+              initialStore = { ...previousStore, uploads: previousStore.uploads || {} }
+              console.info('[taskflow-api] Imported store into SQLite from:', candidateFile)
+              break
+            }
+          } catch (error) {
+            if (error.code !== 'ENOENT') console.warn('[taskflow-api] Store candidate read error:', error.message)
           }
-          initialStore = { ...previousStore, uploads: previousStore.uploads || {} }
-          console.info('[taskflow-api] Imported existing store.json into SQLite.')
-        } catch (error) {
-          if (error.code !== 'ENOENT') throw error
         }
         database.prepare(
           'INSERT INTO app_state (id, store_json, updated_at) VALUES (1, ?, ?)'
@@ -343,6 +391,31 @@ async function sessionUser(req) {
   const token = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1] ||
     cookieValue(req, 'taskflow_session')
   if (!token) return null
+
+  // ── 1. Self-signed token (works across Vercel cold starts; no DB needed for verification)
+  if (token.includes('.')) {
+    const payload = verifyToken(token)
+    if (!payload) return null           // tampered / invalid
+    if (payload.exp <= Date.now()) return null  // expired
+
+    const tokenUser = payload.user
+    // Cross-check the store so that deleted / revoked users are rejected
+    try {
+      const store = await readStore()
+      if (tokenUser.isAdmin) {
+        if (!store.auth.adminPin) return null   // admin PIN removed
+        return { ...tokenUser, token }
+      }
+      const live = store.auth.users.find((u) => u.id === tokenUser.id)
+      if (!live) return null             // user deleted
+      return { ...publicUser(live), isAdmin: false, token }
+    } catch {
+      // If store read fails (e.g. very first cold start), trust the signed token
+      return { ...tokenUser, token }
+    }
+  }
+
+  // ── 2. Postgres lookup for existing opaque tokens (legacy support)
   if (process.env.DATABASE_URL) {
     try {
       const db = await openDatabase()
@@ -354,9 +427,10 @@ async function sessionUser(req) {
         const user = parseJsonValue(session.user_json, null)
         if (user) return { ...user, token }
       }
+      return null
     } catch (err) {
       if (/quota|limit|connection/i.test(err.message)) {
-        console.error('[taskflow-api] Postgres quota exceeded in sessionUser. Falling back to memory/SQLite:', err.message)
+        console.error('[taskflow-api] Postgres quota exceeded in sessionUser – falling back to signed-token mode:', err.message)
         postgresClient = null
         delete process.env.DATABASE_URL
         databaseReady = null
@@ -365,13 +439,15 @@ async function sessionUser(req) {
       }
     }
   }
-  const session = sessions.get(token)
-  if (!session) return null
-  if (session.expiresAt <= Date.now()) {
+
+  // ── 3. In-process memory cache (warm lambda / local dev only)
+  const cached = sessions.get(token)
+  if (!cached) return null
+  if (cached.expiresAt <= Date.now()) {
     sessions.delete(token)
     return null
   }
-  return { ...session.user, token }
+  return { ...cached.user, token }
 }
 
 function canAccess(user, collection, method, data) {
@@ -442,8 +518,13 @@ function getPath(query) {
 }
 
 async function taskflowSession(user, remember) {
-  const token = randomBytes(32).toString('base64url')
   const expiresAt = Date.now() + (remember ? SESSION_TTL : 12 * 60 * 60 * 1000)
+
+  // Always issue a self-signed token so the session is verifiable without any DB
+  // (survives Vercel cold starts and Postgres quota limits)
+  const token = signToken({ user, exp: expiresAt })
+
+  // Best-effort: also cache in memory and persist to Postgres if available
   sessions.set(token, { user, expiresAt })
   if (process.env.DATABASE_URL) {
     try {
@@ -451,15 +532,16 @@ async function taskflowSession(user, remember) {
       await db`
         INSERT INTO auth_sessions (session_id, user_json, expires_at)
         VALUES (${token}, ${JSON.stringify(user)}::jsonb, ${new Date(expiresAt).toISOString()})
+        ON CONFLICT (session_id) DO NOTHING
       `
     } catch (err) {
       if (/quota|limit|connection/i.test(err.message)) {
-        console.error('[taskflow-api] Postgres quota exceeded in taskflowSession. Falling back to memory/SQLite:', err.message)
+        console.warn('[taskflow-api] Postgres unavailable in taskflowSession; using signed token fallback.')
         postgresClient = null
         delete process.env.DATABASE_URL
         databaseReady = null
       } else {
-        throw err
+        console.error('[taskflow-api] Session persist error (non-fatal):', err.message)
       }
     }
   }
