@@ -344,14 +344,26 @@ async function sessionUser(req) {
     cookieValue(req, 'taskflow_session')
   if (!token) return null
   if (process.env.DATABASE_URL) {
-    const db = await openDatabase()
-    const [session] = await db`
-      SELECT user_json FROM auth_sessions
-      WHERE session_id = ${token} AND expires_at > NOW()
-    `
-    if (!session) return null
-    const user = parseJsonValue(session.user_json, null)
-    return user ? { ...user, token } : null
+    try {
+      const db = await openDatabase()
+      const [session] = await db`
+        SELECT user_json FROM auth_sessions
+        WHERE session_id = ${token} AND expires_at > NOW()
+      `
+      if (session) {
+        const user = parseJsonValue(session.user_json, null)
+        if (user) return { ...user, token }
+      }
+    } catch (err) {
+      if (/quota|limit|connection/i.test(err.message)) {
+        console.error('[taskflow-api] Postgres quota exceeded in sessionUser. Falling back to memory/SQLite:', err.message)
+        postgresClient = null
+        delete process.env.DATABASE_URL
+        databaseReady = null
+      } else {
+        throw err
+      }
+    }
   }
   const session = sessions.get(token)
   if (!session) return null
@@ -432,46 +444,75 @@ function getPath(query) {
 async function taskflowSession(user, remember) {
   const token = randomBytes(32).toString('base64url')
   const expiresAt = Date.now() + (remember ? SESSION_TTL : 12 * 60 * 60 * 1000)
+  sessions.set(token, { user, expiresAt })
   if (process.env.DATABASE_URL) {
-    const db = await openDatabase()
-    await db`
-      INSERT INTO auth_sessions (session_id, user_json, expires_at)
-      VALUES (${token}, ${JSON.stringify(user)}::jsonb, ${new Date(expiresAt).toISOString()})
-    `
-  } else {
-    sessions.set(token, { user, expiresAt })
+    try {
+      const db = await openDatabase()
+      await db`
+        INSERT INTO auth_sessions (session_id, user_json, expires_at)
+        VALUES (${token}, ${JSON.stringify(user)}::jsonb, ${new Date(expiresAt).toISOString()})
+      `
+    } catch (err) {
+      if (/quota|limit|connection/i.test(err.message)) {
+        console.error('[taskflow-api] Postgres quota exceeded in taskflowSession. Falling back to memory/SQLite:', err.message)
+        postgresClient = null
+        delete process.env.DATABASE_URL
+        databaseReady = null
+      } else {
+        throw err
+      }
+    }
   }
   return token
 }
 
 async function deleteSession(token) {
-  if (process.env.DATABASE_URL) {
-    const db = await openDatabase()
-    await db`DELETE FROM auth_sessions WHERE session_id = ${token}`
-    return
-  }
   sessions.delete(token)
+  if (process.env.DATABASE_URL) {
+    try {
+      const db = await openDatabase()
+      await db`DELETE FROM auth_sessions WHERE session_id = ${token}`
+    } catch (err) {
+      if (/quota|limit|connection/i.test(err.message)) {
+        console.error('[taskflow-api] Postgres quota exceeded in deleteSession:', err.message)
+        postgresClient = null
+        delete process.env.DATABASE_URL
+        databaseReady = null
+      }
+    }
+  }
 }
 
 async function tooManyAttempts(key) {
   const now = Date.now()
   if (process.env.DATABASE_URL) {
-    const db = await openDatabase()
-    const [attempt] = await db`
-      INSERT INTO login_attempts (remote_address, attempt_count, reset_at)
-      VALUES (${key}, 1, ${now + 15 * 60 * 1000})
-      ON CONFLICT (remote_address) DO UPDATE SET
-        attempt_count = CASE
-          WHEN login_attempts.reset_at <= ${now} THEN 1
-          ELSE login_attempts.attempt_count + 1
-        END,
-        reset_at = CASE
-          WHEN login_attempts.reset_at <= ${now} THEN ${now + 15 * 60 * 1000}
-          ELSE login_attempts.reset_at
-        END
-      RETURNING attempt_count
-    `
-    return attempt.attempt_count > 10
+    try {
+      const db = await openDatabase()
+      const [attempt] = await db`
+        INSERT INTO login_attempts (remote_address, attempt_count, reset_at)
+        VALUES (${key}, 1, ${now + 15 * 60 * 1000})
+        ON CONFLICT (remote_address) DO UPDATE SET
+          attempt_count = CASE
+            WHEN login_attempts.reset_at <= ${now} THEN 1
+            ELSE login_attempts.attempt_count + 1
+          END,
+          reset_at = CASE
+            WHEN login_attempts.reset_at <= ${now} THEN ${now + 15 * 60 * 1000}
+            ELSE login_attempts.reset_at
+          END
+        RETURNING attempt_count
+      `
+      return attempt.attempt_count > 10
+    } catch (err) {
+      if (/quota|limit|connection/i.test(err.message)) {
+        console.error('[taskflow-api] Postgres quota exceeded in tooManyAttempts. Falling back to memory:', err.message)
+        postgresClient = null
+        delete process.env.DATABASE_URL
+        databaseReady = null
+        return tooManyAttempts(key)
+      }
+      throw err
+    }
   }
   const existing = loginAttempts.get(key) || { count: 0, resetAt: now + 15 * 60 * 1000 }
   if (existing.resetAt <= now) {
@@ -1402,18 +1443,36 @@ async function handleRequest(req, res) {
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed.' }, { Allow: 'GET' })
       const requestedLimit = Number(url.searchParams.get('limit') || 200)
       const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 500) : 200
-      const db = await openDatabase()
-      const events = process.env.DATABASE_URL
-        ? await db`
-            SELECT id, created_at, actor_id, actor_name, action, collection, document_id, details_json
-            FROM audit_events ORDER BY id DESC LIMIT ${limit}
-          `
-        : db.prepare(`
+      let events
+      try {
+        const db = await openDatabase()
+        events = process.env.DATABASE_URL
+          ? await db`
+              SELECT id, created_at, actor_id, actor_name, action, collection, document_id, details_json
+              FROM audit_events ORDER BY id DESC LIMIT ${limit}
+            `
+          : db.prepare(`
+              SELECT id, created_at, actor_id, actor_name, action, collection, document_id, details_json
+              FROM audit_events
+              ORDER BY id DESC
+              LIMIT ?
+            `).all(limit)
+      } catch (err) {
+        if (process.env.DATABASE_URL && /quota|limit|connection/i.test(err.message)) {
+          postgresClient = null
+          delete process.env.DATABASE_URL
+          databaseReady = null
+          const db = await openDatabase()
+          events = db.prepare(`
             SELECT id, created_at, actor_id, actor_name, action, collection, document_id, details_json
             FROM audit_events
             ORDER BY id DESC
             LIMIT ?
           `).all(limit)
+        } else {
+          throw err
+        }
+      }
       return json(
         res,
         200,
